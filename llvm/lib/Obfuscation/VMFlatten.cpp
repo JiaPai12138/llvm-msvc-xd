@@ -36,8 +36,6 @@
 #endif
 #include <vector>
 
-// 添加USE_VM32宏控制32/64位模式
-#define USE_VM32
 
 // #define RUN_BLOCK 1
 // #define JMP_BORING 2
@@ -47,6 +45,7 @@ using namespace llvm;
 static cl::opt<bool>
     RunVmFlatObfuscationPass("vm-fla", cl::init(false),
                              cl::desc("OLLVM - VmFlattenObfuscationPass"));
+
 
 /*
 static cl::opt<bool>
@@ -70,6 +69,10 @@ static cl::opt<int> VmObfuProbRate(
 static cl::opt<int> VmObfuscationLevel(
     "vm-fla-level", cl::init(7),
     cl::desc("OLLVM - VmFlattenObfuscationPass Level"));
+
+// static cl::opt<bool> VmFlatObfusWin32(
+//       "use-vm32", cl::init(false),
+//       cl::desc("OLLVM - VmFlattenObfuscationPass Win32"));
 
 
 namespace  llvm {
@@ -127,6 +130,13 @@ struct VMFlat {
   void insertSymbolicMemorySnippet(Function &F);
   void hex2i64(uint8_t *hex, uint32_t size, uint64_t *i64_arr);
   bool runVmFlaOnFunction(Function &function);
+  bool isFunction32Bit(llvm::Function *F) {
+    llvm::Module *M = F->getParent();
+    if (!M) return false;
+    
+    const llvm::DataLayout &DL = M->getDataLayout();
+    return DL.getPointerSize() == 4; // 32位系统的指针大小为4字节
+  }  
 };
 
 std::vector<BasicBlock *> *VMFlat::get_blocks(Function *function,
@@ -379,12 +389,11 @@ bool VMFlat::DoFlatten(Function *f) {
   // errs() << "end gen ins\r\n";
   // dump_inst(&all_inst);
   std::vector<Constant *> opcodes;
+  auto type_int_ty =Type::getInt64Ty(f->getContext());
   [[maybe_unused]] auto type_int32_ty = Type::getInt32Ty(f->getContext());
-#if defined(USE_VM32)
-  auto type_int_ty = type_int32_ty;
-#else
-  auto type_int_ty = Type::getInt64Ty(f->getContext());
-#endif
+  if (isFunction32Bit(f))
+    type_int_ty = type_int32_ty;
+  
   for (auto inst : all_inst) {
     opcodes.push_back(ConstantInt::get(type_int_ty, inst->type));
     opcodes.push_back(ConstantInt::get(type_int_ty, inst->op1));
@@ -518,12 +527,11 @@ bool VMFlat::DoFlatten(Function *f) {
   ArrayType * array_table_type = ArrayType::get(irb.getInt8Ty(), 256);
   Value *table1 = irb.CreateAlloca(array_table_type);
   Value *table2 = irb.CreateAlloca(array_table_type);
+  auto  ptr_array_type = ArrayType::get(irb.getInt64Ty(), 32);
+  const auto is32 = isFunction32Bit(&F);
+  if(is32)
+    ptr_array_type = ArrayType::get(irb.getInt32Ty(), 32);
 
-#if defined(USE_VM32)
-  const auto ptr_array_type = ArrayType::get(irb.getInt32Ty(), 32);
-#else
-  const auto ptr_array_type = ArrayType::get(irb.getInt64Ty(), 32);
-#endif
   Value *ptr1 = irb.CreateBitCast(table1, PointerType::get(ptr_array_type,
                                     dyn_cast<PointerType>(table1->getType())->getAddressSpace()));
   Value *ptr2 = irb.CreateBitCast(table2, PointerType::get(ptr_array_type,
@@ -534,16 +542,27 @@ bool VMFlat::DoFlatten(Function *f) {
     buf[i] = static_cast<uint8_t>(i);
   }
   const auto *p_buf = reinterpret_cast<uint64_t *>(buf);
-  for (int i = 0; i < (256 / 8); i++) {
-#if defined(USE_VM32)
-    irb.CreateStore(irb.getInt32(p_buf[i]), irb.CreateConstGEP2_32(ptr_array_type,ptr1, 0, i))->setVolatile(true);
-    irb.CreateStore(irb.getInt32(p_buf[i]), irb.CreateConstGEP2_32(ptr_array_type,ptr2, 0, i))->setVolatile(true);
-#else
-    irb.CreateStore(irb.getInt64(p_buf[i]), irb.CreateConstGEP2_64(ptr_array_type,ptr1, 0, i))->setVolatile(true);
-    irb.CreateStore(irb.getInt64(p_buf[i]), irb.CreateConstGEP2_64(ptr_array_type,ptr2, 0, i))->setVolatile(true);
-#endif
-  }
+  if (is32) {
+    for (int i = 0; i < (256 / 4); i++) {
 
+      irb.CreateStore(irb.getInt32(p_buf[i]),
+                      irb.CreateConstGEP2_32(ptr_array_type, ptr1, 0, i))
+          ->setVolatile(true);
+      irb.CreateStore(irb.getInt32(p_buf[i]),
+                      irb.CreateConstGEP2_32(ptr_array_type, ptr2, 0, i))
+          ->setVolatile(true);
+    }
+  } else {
+    for (int i = 0; i < (256 / 8); i++) {
+
+      irb.CreateStore(irb.getInt64(p_buf[i]),
+                      irb.CreateConstGEP2_64(ptr_array_type, ptr1, 0, i))
+          ->setVolatile(true);
+      irb.CreateStore(irb.getInt64(p_buf[i]),
+                      irb.CreateConstGEP2_64(ptr_array_type, ptr2, 0, i))
+          ->setVolatile(true);
+    }
+  }
   for (BasicBlock &BB: F) {
     if (&BB == &entry) {
       continue;
@@ -574,13 +593,8 @@ bool VMFlat::DoFlatten(Function *f) {
               index = builder.CreateAnd(index, builder.getInt32(0xFF));
               break;
             case 64:
-#if defined(USE_VM32)
-              index = builder.CreateXor(v, builder.CreateLShr(v,cryptoutils->get_uint32_t() % 32));
-              index = builder.CreateAnd(index, builder.getInt32(0xFF));
-#else
               index = builder.CreateXor(v, builder.CreateLShr(v,cryptoutils->get_uint32_t() % 64));
               index = builder.CreateAnd(index, builder.getInt64(0xFF));
-#endif
               break;
             }
             Value *idx[2] = {builder.getInt32(0), index};
@@ -617,16 +631,16 @@ bool VMFlat::DoFlatten(Function *f) {
   IRBuilder<> builder(entryBB.getFirstNonPHIOrDbgOrLifetime());
   const auto array_type =ArrayType::get(Type::getInt8Ty(F.getContext()), 256);
   const auto array = builder.CreateAlloca(array_type);
-
-
+  auto i64_ptr_type = PointerType::get(
+        ArrayType::get(builder.getInt64Ty(), 32),
+        dyn_cast<PointerType>(array->getType())->getAddressSpace());
+  const auto is32 = isFunction32Bit(&F);
   //initialize the array
   //array[i] = i
-#if defined(USE_VM32)
-  const auto i64_ptr_type =PointerType::get(ArrayType::get(builder.getInt32Ty(), 32),
-#else
-  const auto i64_ptr_type =PointerType::get(ArrayType::get(builder.getInt64Ty(), 32),
-#endif
-                                           dyn_cast<PointerType>(array->getType())->getAddressSpace());
+  if (is32)
+    i64_ptr_type = PointerType::get(
+        ArrayType::get(builder.getInt32Ty(), 32),
+        dyn_cast<PointerType>(array->getType())->getAddressSpace());
 
   Value *i64_ptr = builder.CreateBitCast(array,i64_ptr_type);
 
@@ -637,16 +651,24 @@ bool VMFlat::DoFlatten(Function *f) {
     buf[i] = static_cast<uint8_t>(i);
   }
   hex2i64(buf, 256, i64_arr);
-  for (int i = 0; i < (256 / 8); i++) {
-#if defined(USE_VM32)
-    builder.CreateStore(builder.getInt32(i64_arr[i]),
-                        builder.CreateConstGEP2_32(ArrayType::get(builder.getInt32Ty(), 32),i64_ptr, 0, i),true);
-#else
-    builder.CreateStore(builder.getInt64(i64_arr[i]),
-                        builder.CreateConstGEP2_64(ArrayType::get(builder.getInt64Ty(), 32),i64_ptr, 0, i),true);
-#endif
-  }
+  if (is32) {
+    for (int i = 0; i < (256 / 4); i++) {
 
+      builder.CreateStore(
+          builder.getInt32(i64_arr[i]),
+          builder.CreateConstGEP2_32(ArrayType::get(builder.getInt32Ty(), 32),
+                                     i64_ptr, 0, i),
+          true);
+    }
+  } else {
+    for (int i = 0; i < (256 / 8); i++) {
+      builder.CreateStore(
+          builder.getInt64(i64_arr[i]),
+          builder.CreateConstGEP2_64(ArrayType::get(builder.getInt64Ty(), 32),
+                                     i64_ptr, 0, i),
+          true);
+    }
+  }
 
   for (BasicBlock &bb: F) {
     if (&bb == &entryBB) {
@@ -684,25 +706,15 @@ bool VMFlat::DoFlatten(Function *f) {
           num_ty = builder.getInt32Ty();
         }
         else {
-#if defined(USE_VM32)
-          magic_ff = builder.getInt32(0xFF);
-          magic_0 = builder.getInt32(0);
-          num_ty = builder.getInt32Ty();
-#else
           magic_ff = builder.getInt64(0xFF);
           magic_0 = builder.getInt64(0);
           num_ty = builder.getInt64Ty();
-#endif
         }
 
         bytes[0] = builder.CreateAnd(v, magic_ff);
 
         for (int j = 1; j < len_of_bytes; j++) {
-#if defined(USE_VM32)
           bytes[j] = builder.CreateAnd(builder.CreateLShr(v, j * 8), magic_ff);
-#else
-          bytes[j] = builder.CreateAnd(builder.CreateLShr(v, j * 8), magic_ff);
-#endif
         }
 
         //bytes[i] = array[bytes[i]]
