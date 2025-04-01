@@ -20,7 +20,7 @@ jobs:
 
     - name: Setup build deps
       run: |
-          && sudo apt-get install build-essential make cmake \
+          sudo apt-get install build-essential make cmake \
           && sudo apt-get install p7zip-full p7zip-rar \
           && sudo apt-get install gcc-10 g++-10 g++-10-aarch64-linux-gnu libstdc++-10-dev-arm64-cross
           
