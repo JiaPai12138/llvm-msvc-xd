@@ -36,6 +36,9 @@
 #endif
 #include <vector>
 
+// 添加USE_VM32宏控制32/64位模式
+#define USE_VM32
+
 // #define RUN_BLOCK 1
 // #define JMP_BORING 2
 // #define JMP_SELECT 3
@@ -377,15 +380,19 @@ bool VMFlat::DoFlatten(Function *f) {
   // dump_inst(&all_inst);
   std::vector<Constant *> opcodes;
   [[maybe_unused]] auto type_int32_ty = Type::getInt32Ty(f->getContext());
-  auto type_int64_ty = Type::getInt64Ty(f->getContext());
+#if defined(USE_VM32)
+  auto type_int_ty = type_int32_ty;
+#else
+  auto type_int_ty = Type::getInt64Ty(f->getContext());
+#endif
   for (auto inst : all_inst) {
-    opcodes.push_back(ConstantInt::get(type_int64_ty, inst->type));
-    opcodes.push_back(ConstantInt::get(type_int64_ty, inst->op1));
-    opcodes.push_back(ConstantInt::get(type_int64_ty, inst->op2));
+    opcodes.push_back(ConstantInt::get(type_int_ty, inst->type));
+    opcodes.push_back(ConstantInt::get(type_int_ty, inst->op1));
+    opcodes.push_back(ConstantInt::get(type_int_ty, inst->op2));
   }
   // errs() << "inst ok\r\n";
 
-  ArrayType *at = ArrayType::get(type_int64_ty, opcodes.size());
+  ArrayType *at = ArrayType::get(type_int_ty, opcodes.size());
   Constant *opcode_array =
       ConstantArray::get(at, ArrayRef<Constant *>(opcodes));
   auto oparr_var = new GlobalVariable(*(f->getParent()), at, false,
@@ -394,24 +401,24 @@ bool VMFlat::DoFlatten(Function *f) {
   // ȥ����һ��������ĩβ����ת
   old_entry->getTerminator()->eraseFromParent();
   auto vm_pc =
-      new AllocaInst(type_int64_ty, 0, Twine(new_name_pre + "VMpc"), old_entry);
-  ConstantInt *init_pc = ConstantInt::get(type_int64_ty, 0);
+      new AllocaInst(type_int_ty, 0, Twine(new_name_pre + "VMpc"), old_entry);
+  ConstantInt *init_pc = ConstantInt::get(type_int_ty, 0);
   new StoreInst(init_pc, vm_pc, old_entry);
-  auto vm_flag = new AllocaInst(type_int64_ty, 0,
+  auto vm_flag = new AllocaInst(type_int_ty, 0,
                                 Twine(new_name_pre + "VMJmpFlag"), old_entry);
   BasicBlock *vm_entry = BasicBlock::Create(
       f->getContext(), Twine(new_name_pre + "VMEntry"), f, firstbb);
 
   BranchInst::Create(vm_entry, old_entry);
   IRBuilder<> IRB(vm_entry);
-  Value *zero = ConstantInt::get(type_int64_ty, 0);
+  Value *zero = ConstantInt::get(type_int_ty, 0);
 
   Value *op1_offset =
       IRB.CreateAdd(IRB.CreateLoad(vm_pc->getAllocatedType(), vm_pc),
-                    ConstantInt::get(type_int64_ty, 1));
+                    ConstantInt::get(type_int_ty, 1));
   Value *op2_offset =
       IRB.CreateAdd(IRB.CreateLoad(vm_pc->getAllocatedType(), vm_pc),
-                    ConstantInt::get(type_int64_ty, 2));
+                    ConstantInt::get(type_int_ty, 2));
 
   auto optype_gep =
       IRB.CreateGEP(oparr_var->getValueType(), oparr_var,
@@ -426,7 +433,7 @@ bool VMFlat::DoFlatten(Function *f) {
 
   IRB.CreateStore(
       IRB.CreateAdd(IRB.CreateLoad(vm_pc->getAllocatedType(), vm_pc),
-                    ConstantInt::get(type_int64_ty, 3)),
+                    ConstantInt::get(type_int_ty, 3)),
       vm_pc);
   BasicBlock *run_block = BasicBlock::Create(
       f->getContext(), new_name_pre + "RunBlock", f, firstbb);
@@ -438,9 +445,9 @@ bool VMFlat::DoFlatten(Function *f) {
       BasicBlock::Create(f->getContext(), new_name_pre + "Default", f, firstbb);
   BranchInst::Create(vm_entry, defaultCase);
   SwitchInst *switch1 = IRB.CreateSwitch(optype, defaultCase, 0);
-  switch1->addCase(ConstantInt::get(type_int64_ty, RUN_BLOCK), run_block);
-  switch1->addCase(ConstantInt::get(type_int64_ty, JMP_BORING), jmp_boring);
-  switch1->addCase(ConstantInt::get(type_int64_ty, JMP_SELECT), jmp_select);
+  switch1->addCase(ConstantInt::get(type_int_ty, RUN_BLOCK), run_block);
+  switch1->addCase(ConstantInt::get(type_int_ty, JMP_BORING), jmp_boring);
+  switch1->addCase(ConstantInt::get(type_int_ty, JMP_SELECT), jmp_select);
 
   // create run_block's basicblock
   // the first choice
@@ -456,7 +463,7 @@ bool VMFlat::DoFlatten(Function *f) {
     // ConstantInt *numCase =
     // cast<ConstantInt>(ConstantInt::get(switch2->getCondition()->getType(),
     // t->value));
-    switch2->addCase(ConstantInt::get(type_int64_ty, t->value), block);
+    switch2->addCase(ConstantInt::get(type_int_ty, t->value), block);
   }
   for (auto block : orig_bb) { // Handle successors
     if (block->getTerminator()->getNumSuccessors() == 1) {
@@ -469,8 +476,8 @@ bool VMFlat::DoFlatten(Function *f) {
       // ////errs() << "\033[1;32mThis block has 2 successors\033[0m\n";
       auto old_br = cast<BranchInst>(block->getTerminator());
       SelectInst *select = SelectInst::Create(
-          old_br->getCondition(), ConstantInt::get(type_int64_ty, 1),
-          ConstantInt::get(type_int64_ty, 0), "", block->getTerminator());
+          old_br->getCondition(), ConstantInt::get(type_int_ty, 1),
+          ConstantInt::get(type_int_ty, 0), "", block->getTerminator());
       new StoreInst(select, vm_flag, block->getTerminator());
       block->getTerminator()->eraseFromParent();
       BranchInst::Create(defaultCase, block);
@@ -490,7 +497,7 @@ bool VMFlat::DoFlatten(Function *f) {
       f->getContext(), new_name_pre + "JmpSelectFalse", f, firstbb);
   IRB.CreateCondBr(
       IRB.CreateICmpEQ(IRB.CreateLoad(vm_flag->getAllocatedType(), vm_flag),
-                       ConstantInt::get(type_int64_ty, 1)),
+                       ConstantInt::get(type_int_ty, 1)),
       select_true, select_false);
   IRB.SetInsertPoint(select_true);
   IRB.CreateStore(op1, vm_pc);
@@ -512,7 +519,11 @@ bool VMFlat::DoFlatten(Function *f) {
   Value *table1 = irb.CreateAlloca(array_table_type);
   Value *table2 = irb.CreateAlloca(array_table_type);
 
+#if defined(USE_VM32)
+  const auto ptr_array_type = ArrayType::get(irb.getInt32Ty(), 32);
+#else
   const auto ptr_array_type = ArrayType::get(irb.getInt64Ty(), 32);
+#endif
   Value *ptr1 = irb.CreateBitCast(table1, PointerType::get(ptr_array_type,
                                     dyn_cast<PointerType>(table1->getType())->getAddressSpace()));
   Value *ptr2 = irb.CreateBitCast(table2, PointerType::get(ptr_array_type,
@@ -524,8 +535,13 @@ bool VMFlat::DoFlatten(Function *f) {
   }
   const auto *p_buf = reinterpret_cast<uint64_t *>(buf);
   for (int i = 0; i < (256 / 8); i++) {
+#if defined(USE_VM32)
+    irb.CreateStore(irb.getInt32(p_buf[i]), irb.CreateConstGEP2_32(ptr_array_type,ptr1, 0, i))->setVolatile(true);
+    irb.CreateStore(irb.getInt32(p_buf[i]), irb.CreateConstGEP2_32(ptr_array_type,ptr2, 0, i))->setVolatile(true);
+#else
     irb.CreateStore(irb.getInt64(p_buf[i]), irb.CreateConstGEP2_64(ptr_array_type,ptr1, 0, i))->setVolatile(true);
     irb.CreateStore(irb.getInt64(p_buf[i]), irb.CreateConstGEP2_64(ptr_array_type,ptr2, 0, i))->setVolatile(true);
+#endif
   }
 
   for (BasicBlock &BB: F) {
@@ -558,8 +574,13 @@ bool VMFlat::DoFlatten(Function *f) {
               index = builder.CreateAnd(index, builder.getInt32(0xFF));
               break;
             case 64:
+#if defined(USE_VM32)
+              index = builder.CreateXor(v, builder.CreateLShr(v,cryptoutils->get_uint32_t() % 32));
+              index = builder.CreateAnd(index, builder.getInt32(0xFF));
+#else
               index = builder.CreateXor(v, builder.CreateLShr(v,cryptoutils->get_uint32_t() % 64));
               index = builder.CreateAnd(index, builder.getInt64(0xFF));
+#endif
               break;
             }
             Value *idx[2] = {builder.getInt32(0), index};
@@ -600,7 +621,11 @@ bool VMFlat::DoFlatten(Function *f) {
 
   //initialize the array
   //array[i] = i
+#if defined(USE_VM32)
+  const auto i64_ptr_type =PointerType::get(ArrayType::get(builder.getInt32Ty(), 32),
+#else
   const auto i64_ptr_type =PointerType::get(ArrayType::get(builder.getInt64Ty(), 32),
+#endif
                                            dyn_cast<PointerType>(array->getType())->getAddressSpace());
 
   Value *i64_ptr = builder.CreateBitCast(array,i64_ptr_type);
@@ -613,8 +638,13 @@ bool VMFlat::DoFlatten(Function *f) {
   }
   hex2i64(buf, 256, i64_arr);
   for (int i = 0; i < (256 / 8); i++) {
+#if defined(USE_VM32)
+    builder.CreateStore(builder.getInt32(i64_arr[i]),
+                        builder.CreateConstGEP2_32(ArrayType::get(builder.getInt32Ty(), 32),i64_ptr, 0, i),true);
+#else
     builder.CreateStore(builder.getInt64(i64_arr[i]),
                         builder.CreateConstGEP2_64(ArrayType::get(builder.getInt64Ty(), 32),i64_ptr, 0, i),true);
+#endif
   }
 
 
@@ -654,15 +684,25 @@ bool VMFlat::DoFlatten(Function *f) {
           num_ty = builder.getInt32Ty();
         }
         else {
+#if defined(USE_VM32)
+          magic_ff = builder.getInt32(0xFF);
+          magic_0 = builder.getInt32(0);
+          num_ty = builder.getInt32Ty();
+#else
           magic_ff = builder.getInt64(0xFF);
           magic_0 = builder.getInt64(0);
           num_ty = builder.getInt64Ty();
+#endif
         }
 
         bytes[0] = builder.CreateAnd(v, magic_ff);
 
         for (int j = 1; j < len_of_bytes; j++) {
+#if defined(USE_VM32)
           bytes[j] = builder.CreateAnd(builder.CreateLShr(v, j * 8), magic_ff);
+#else
+          bytes[j] = builder.CreateAnd(builder.CreateLShr(v, j * 8), magic_ff);
+#endif
         }
 
         //bytes[i] = array[bytes[i]]
