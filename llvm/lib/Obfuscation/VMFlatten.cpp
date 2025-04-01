@@ -129,6 +129,7 @@ struct VMFlat {
   void insertMemoryAttackTaint(Function &F);
   void insertSymbolicMemorySnippet(Function &F);
   void hex2i64(uint8_t *hex, uint32_t size, uint64_t *i64_arr);
+  void hex2i32(uint8_t *hex, uint32_t size, uint32_t *i32_arr);
   bool runVmFlaOnFunction(Function &function);
   bool isFunction32Bit(llvm::Function *F) {
     llvm::Module *M = F->getParent();
@@ -645,22 +646,24 @@ bool VMFlat::DoFlatten(Function *f) {
   Value *i64_ptr = builder.CreateBitCast(array,i64_ptr_type);
 
 
-  uint64_t i64_arr[256 / 8];
+
   uint8_t buf[256];
   for (int i = 0; i < 256; i++) {
     buf[i] = static_cast<uint8_t>(i);
   }
-  hex2i64(buf, 256, i64_arr);
-  if (is32) {
+  if(is32){
+    uint32_t i32_arr[256 / 4];
+    hex2i32(buf, 256, i32_arr);
     for (int i = 0; i < (256 / 4); i++) {
-
       builder.CreateStore(
-          builder.getInt32(i64_arr[i]),
+          builder.getInt32(i32_arr[i]),
           builder.CreateConstGEP2_32(ArrayType::get(builder.getInt32Ty(), 32),
-                                     i64_ptr, 0, i),
+          i64_ptr, 0, i),
           true);
     }
   } else {
+    uint64_t i64_arr[256 / 8];
+    hex2i64(buf, 256, i64_arr);
     for (int i = 0; i < (256 / 8); i++) {
       builder.CreateStore(
           builder.getInt64(i64_arr[i]),
@@ -744,6 +747,12 @@ bool VMFlat::DoFlatten(Function *f) {
 void VMFlat::hex2i64(uint8_t *hex, uint32_t size, uint64_t *i64_arr) {
   for (uint32_t i = 0; i < size; i += 8) {
     i64_arr[i / 8] = *reinterpret_cast<uint64_t *>(hex + i);
+  }
+}
+
+void VMFlat::hex2i32(uint8_t *hex, uint32_t size, uint32_t *i32_arr) {
+  for (uint32_t i = 0; i < size; i += 4) {
+    i32_arr[i / 4] = *reinterpret_cast<uint32_t *>(hex + i);
   }
 }
 
