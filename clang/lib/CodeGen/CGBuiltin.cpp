@@ -16024,6 +16024,37 @@ Value *CodeGenFunction::EmitX86BuiltinExpr(unsigned BuiltinID,
     return Builder.CreateIntCast(MulResult, ResType, IsSigned);
   }
 
+  case X86::BI_udiv128: {
+    llvm::Type *ResType = ConvertType(E->getType());
+    llvm::Type *Int128Ty = llvm::IntegerType::get(getLLVMContext(), 128);
+    llvm::Type *Int64Ty = llvm::IntegerType::get(getLLVMContext(), 64);
+
+    // Retrieve operands
+    Value *HighDividend = Builder.CreateIntCast(Ops[0], Int128Ty, false);
+    Value *LowDividend = Builder.CreateZExt(Ops[1], Int128Ty);
+    Value *Divisor = Ops[2];
+
+    // Combine HighDividend and LowDividend into a 128-bit dividend
+    Value *Dividend = Builder.CreateShl(HighDividend, 64);
+    Dividend = Builder.CreateOr(Dividend, LowDividend);
+
+    // Create Divisor and extend it to 128-bit
+    Value *DivisorExt = Builder.CreateZExt(Divisor, Int128Ty);
+
+    // Perform division
+    Value *Quotient = Builder.CreateUDiv(Dividend, DivisorExt);
+    Value *Remainder = Builder.CreateURem(Dividend, DivisorExt);
+
+    // Truncate results to 64 bits
+    Quotient = Builder.CreateTrunc(Quotient, Int64Ty);
+    Remainder = Builder.CreateTrunc(Remainder, Int64Ty);
+
+    // Store remainder
+    Address RemainderAddr = EmitPointerWithAlignment(E->getArg(3));
+    Builder.CreateStore(Remainder, RemainderAddr);
+
+    return Quotient; // Return the quotient as the result
+  }
   case X86::BI__faststorefence: {
     return Builder.CreateFence(llvm::AtomicOrdering::SequentiallyConsistent,
                                llvm::SyncScope::System);

@@ -98,6 +98,13 @@ struct xvmm {
                    int mem_base);
   //int get_unique_uint8_t(std::vector<uint8_t> & op_u);
   bool run_on_function(Function &f);
+  bool isFunction32Bit(llvm::Function *F) {
+    llvm::Module *M = F->getParent();
+    if (!M) return false;
+    
+    const llvm::DataLayout &DL = M->getDataLayout();
+    return DL.getPointerSize() == 4; // 32位系统的指针大小为4字节
+  }  
 };
 
 void xvmm::demote_registers(Function *f) { fixStack(*f, true); }
@@ -212,7 +219,7 @@ Function *xvmm::virtualization(Function &f) {
                   alloca_map);
 #if 1
 
-  if (need_obf) {
+  if (need_obf && !isFunction32Bit(vm_func)) {
     auto *AsmStr = InlineAsm::get(FunctionType::get(Type::getVoidTy(vm_func->getContext()), false),
                                         "backend-obfu", /* Constraints */ "", /* hasSideEffects */ true);
 
