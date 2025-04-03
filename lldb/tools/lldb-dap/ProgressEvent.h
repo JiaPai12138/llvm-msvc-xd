@@ -13,7 +13,6 @@
 #include <thread>
 #include <chrono>
 
-
 #include "DAPForward.h"
 
 #include "llvm/Support/JSON.h"
