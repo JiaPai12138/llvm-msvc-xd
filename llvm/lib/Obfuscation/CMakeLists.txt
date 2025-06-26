@@ -26,6 +26,7 @@ add_llvm_pass_plugin(Obfuscation
         IndirectBranch.cpp
         GlobalsEncryption.cpp
         CustomCC.cpp
+        AntiIDA.cpp
         Plugin.cpp
 
         ADDITIONAL_HEADER_DIRS
