@@ -13,6 +13,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
+#include <Utils.h>
 #include <iomanip>
 #include <regex>
 #include <sstream>
@@ -28,8 +29,18 @@ PreservedAnalyses AntiIDAPass::run(Module &M, ModuleAnalysisManager &) {
   if (!RunIDAPass) {
     return PreservedAnalyses::all();
   }
-  for (Function &F : M)
+  for (Function &F : M) {
+    if(F.getName().starts_with("??") || F.getName().contains("std@")) {
+      continue;
+    }
+    if (F.hasCXXEH() || F.hasCXXSEH()) {
+      continue;
+    }
+    if (!toObfuscate(RunIDAPass, &F, "ida-obfus"))
+      continue;
+
     injectBytes(F);
+  }
   return PreservedAnalyses::none();
 }
 void AntiIDAPass::injectBytes(Function &F) {
