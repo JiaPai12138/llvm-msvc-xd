@@ -35,7 +35,7 @@ PreservedAnalyses AntiIDAPass::run(Module &M, ModuleAnalysisManager &) {
 void AntiIDAPass::injectBytes(Function &F) {
   LLVMContext &Ctx = F.getContext();
   static std::mt19937_64 rng(std::random_device{}());
-  std::uniform_int_distribution<uint8_t> dist(0, 0xFF);
+  std::uniform_int_distribution<unsigned int> dist(0, 0xFF);
 
   // Create inline assembly with specially crafted bytes to confuse
   // disassemblers
