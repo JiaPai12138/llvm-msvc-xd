@@ -36,6 +36,7 @@ https://github.com/gmh5225/awesome-llvm-security#ollvm
 - ~~[ ] x-var-rot 待处理~~
 - [x] 新功能
 - [x] custom-cc 参数传递和返回值的方法
+- [x] anti-ida, copy from some other ollvm codes
 - [ ] new functions
 
 
@@ -130,7 +131,7 @@ set /O2 on
 ```
 #### 单纯使用特色部分（轻量模式 不加Light会导致文件飞升到10MB）
 ```
--mllvm -data-obfus -mllvm -const-obfus -mllvm -string-obfus -mllvm -ind-call -mllvm -vm-fla -mllvm -vm-fla-level=0 -mllvm -x-fla-enh -mllvm -x-combine -mllvm -x-linear
+-mllvm -data-obfus -mllvm -const-obfus -mllvm -string-obfus -mllvm -ind-call -mllvm -vm-fla -mllvm -vm-fla-level=0 -mllvm -x-fla-enh -mllvm -x-combine -mllvm -x-linear -mllvm -ida-obfus
 ```
 #### 需要修改载研究的部分
 ```
