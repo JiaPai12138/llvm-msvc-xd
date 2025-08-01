@@ -23,6 +23,7 @@
 #include <GlobalsEncryption.h>
 #include <IndirectBranch.h>
 #include <CustomCC.h>
+#include <AntiIDA.h>
 
 using namespace llvm;
 
@@ -67,6 +68,7 @@ llvm::PassPluginLibraryInfo getObfuscationPluginInfo() {
           MPM.addPass(Linearize());
           MPM.addPass(EasyCfgPass());
           MPM.addPass(createModuleToFunctionPassAdaptor(IndirectBranch()));
+          MPM.addPass(AntiIDAPass());
           
         });
         //PB.registerVectorizerStartEPCallback(
