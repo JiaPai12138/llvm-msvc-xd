@@ -45,7 +45,6 @@ install/
 /GSYMS
 /GTAGS
 /ID
-/.github
 /.ci
 .gitusers
 autom4te.cache
