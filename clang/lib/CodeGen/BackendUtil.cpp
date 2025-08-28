@@ -894,7 +894,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
   for (auto PassCallback : ListRegisterPassBuilderCallbacks) {
     PassCallback(PB);
   }
-  
+
   // Register the target library analysis directly and give it a customized
   // preset TLI.
   std::unique_ptr<TargetLibraryInfoImpl> TLII(
@@ -1047,7 +1047,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
 
     // Convert @llvm.global.annotations to !annotation metadata.
     MPM.addPassToFront(Annotation2MetadataPass());
-    
+
     // MSVC macro rebuilding pass (this pass must be at the top)
     MPM.addPassToFront(MSVCMacroRebuildingPass());
   }
@@ -1055,17 +1055,17 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
   // Post pass
   {
     // Welcome to llvm-msvc pass
-    // MPM.addPass(WelcomeToLLVMMSVCPass(true));
-    
+    MPM.addPass(WelcomeToLLVMMSVCPass(false));
+
     // IR auto generator pass(Post)
     MPM.addPass(IRAutoGeneratorPostPass(CodeGenOpts.AutoGenerateIR,
                                           "IRAutoGeneratorPost"));
-    
+
     // Bitcode auto generator pass(Post)
     MPM.addPass(BitcodeAutoGeneratorPostPass(CodeGenOpts.AutoGenerateBitcode,
                                               "BitcodeAutoGeneratorPost"));
   }
-  
+
   if (Action == Backend_EmitBC || Action == Backend_EmitLL) {
     if (CodeGenOpts.PrepareForThinLTO && !CodeGenOpts.DisableLLVMPasses) {
       if (!TheModule->getModuleFlag("EnableSplitLTOUnit"))
@@ -1116,7 +1116,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     if (!TheModule->getModuleFlag("UnifiedLTO"))
       TheModule->addModuleFlag(llvm::Module::Error, "UnifiedLTO", uint32_t(1));
   }
-  
+
   // Print a textual, '-passes=' compatible, representation of pipeline if
   // requested.
   if (PrintPipelinePasses) {
