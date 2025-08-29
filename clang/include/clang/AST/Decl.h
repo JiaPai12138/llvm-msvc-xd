@@ -4977,7 +4977,7 @@ void Redeclarable<decl_type>::setPreviousDecl(decl_type *PrevDecl) {
 ///
 /// We use this function to break a cycle between the inline definitions in
 /// Type.h and Decl.h.
-inline bool IsEnumDeclComplete(EnumDecl *ED) {
+static bool IsEnumDeclComplete(EnumDecl *ED) {
   return ED->isComplete();
 }
 
@@ -4985,7 +4985,7 @@ inline bool IsEnumDeclComplete(EnumDecl *ED) {
 ///
 /// We use this function to break a cycle between the inline definitions in
 /// Type.h and Decl.h.
-inline bool IsEnumDeclScoped(EnumDecl *ED) {
+static bool IsEnumDeclScoped(EnumDecl *ED) {
   return ED->isScoped();
 }
 

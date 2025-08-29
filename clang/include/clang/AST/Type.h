@@ -7625,6 +7625,9 @@ QualType DecayedType::getPointeeType() const {
 void FixedPointValueToString(SmallVectorImpl<char> &Str, llvm::APSInt Val,
                              unsigned Scale);
 
+
+
+
 } // namespace clang
 
 #endif // LLVM_CLANG_AST_TYPE_H
