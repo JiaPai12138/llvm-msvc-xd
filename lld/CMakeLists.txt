@@ -116,10 +116,10 @@ if(LLD_VENDOR)
   add_definitions(-DLLD_VENDOR="${LLD_VENDOR}")
 endif()
 
-option(FAKE_RICH_HEADER "Enable fake rich header" OFF)
-if(FAKE_RICH_HEADER)
-    add_definitions(-DFAKE_RICH_HEADER)
-endif()
+# option(FAKE_RICH_HEADER "Enable fake rich header" OFF)
+# if(FAKE_RICH_HEADER)
+#     add_definitions(-DFAKE_RICH_HEADER)
+# endif()
 
 # Compute the LLD version from the LLVM version.
 string(REGEX MATCH "[0-9]+\\.[0-9]+(\\.[0-9]+)?" LLD_VERSION

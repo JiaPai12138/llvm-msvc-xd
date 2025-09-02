@@ -32,6 +32,8 @@
 #include "llvm/Support/RandomNumberGenerator.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/xxhash.h"
+#include "llvm/Support/CommandLine.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <map>
@@ -46,6 +48,8 @@ using namespace llvm::support::endian;
 using namespace lld;
 using namespace lld::coff;
 
+
+cl::opt<bool> useRich("rich", cl::desc("Enable rich header"));
 /* To re-generate DOSProgram:
 $ cat > /tmp/DOSProgram.asm
 org 0
@@ -66,8 +70,8 @@ align 8, db 0
 $ nasm -fbin /tmp/DOSProgram.asm -o /tmp/DOSProgram.bin
 $ xxd -i /tmp/DOSProgram.bin
 */
-#if defined(FAKE_RICH_HEADER)
-static unsigned char dosProgram[] = {
+
+static unsigned char dosProgram_rich[] = {
   0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
   0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72,
   0x61, 0x6d, 0x20, 0x63, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x20, 0x62, 0x65,
@@ -83,7 +87,10 @@ static unsigned char dosProgram[] = {
   0x52, 0x69, 0x63, 0x68, 0x73, 0xC6, 0xD4, 0x60, 0x00, 0x00, 0x00, 0x00, 
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
-#else
+
+static_assert(sizeof(dosProgram_rich) % 8 == 0,
+              "DOSProgram size must be multiple of 8");
+
 static unsigned char dosProgram[] = {
   0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
   0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72,
@@ -91,12 +98,16 @@ static unsigned char dosProgram[] = {
   0x20, 0x72, 0x75, 0x6e, 0x20, 0x69, 0x6e, 0x20, 0x44, 0x4f, 0x53, 0x20,
   0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x0d, 0x0d, 0x0a
 };
-#endif
+
 static_assert(sizeof(dosProgram) % 8 == 0,
               "DOSProgram size must be multiple of 8");
 
 static const int dosStubSize = sizeof(dos_header) + sizeof(dosProgram);
 static_assert(dosStubSize % 8 == 0, "DOSStub size must be multiple of 8");
+
+static const int dosStubSize_rich = sizeof(dos_header) + sizeof(dosProgram_rich);
+static_assert(dosStubSize_rich % 8 == 0, "DOSStub size must be multiple of 8");
+
 
 static const int numberOfDataDirectory = 16;
 
@@ -728,7 +739,7 @@ void Writer::writePEChecksum() {
   uint32_t size = (uint32_t)(buffer->getBufferSize());
 
   coff_file_header *coffHeader =
-      (coff_file_header *)((uint8_t *)buf + dosStubSize + sizeof(PEMagic));
+      (coff_file_header *)((uint8_t *)buf + useRich?dosStubSize_rich:dosStubSize + sizeof(PEMagic));
   pe32_header *peHeader =
       (pe32_header *)((uint8_t *)coffHeader + sizeof(coff_file_header));
   uint32_t oldCheckSum = peHeader->CheckSum;
@@ -1577,7 +1588,7 @@ void Writer::assignAddresses() {
   // We do it here to make sure that we account for range extension chunks.
   createECCodeMap();
 
-  sizeOfHeaders = dosStubSize + sizeof(PEMagic) + sizeof(coff_file_header) +
+  sizeOfHeaders = useRich?dosStubSize_rich:dosStubSize + sizeof(PEMagic) + sizeof(coff_file_header) +
                   sizeof(data_directory) * numberOfDataDirectory +
                   sizeof(coff_section) * ctx.outputSections.size();
   sizeOfHeaders +=
@@ -1646,17 +1657,17 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   buf += sizeof(dos_header);
   dos->Magic[0] = 'M';
   dos->Magic[1] = 'Z';
-  dos->UsedBytesInTheLastPage = dosStubSize % 512;
+  dos->UsedBytesInTheLastPage = useRich?dosStubSize_rich:dosStubSize % 512;
   dos->FileSizeInPages = 3;
   dos->HeaderSizeInParagraphs = sizeof(dos_header) / 16;
   dos->MaximumExtraParagraphs = 0xFFFF;
   dos->InitialSP = 0xB8;
   dos->AddressOfRelocationTable = sizeof(dos_header);
-  dos->AddressOfNewExeHeader = dosStubSize;
+  dos->AddressOfNewExeHeader = useRich?dosStubSize_rich:dosStubSize;
 
   // Write DOS program.
-  memcpy(buf, dosProgram, sizeof(dosProgram));
-  buf += sizeof(dosProgram);
+  memcpy(buf, useRich?dosProgram_rich:dosProgram, useRich?dosStubSize_rich:dosStubSize - sizeof(dos_header));
+  buf += useRich?dosStubSize_rich:dosStubSize - sizeof(dos_header);
 
   // Write PE magic
   memcpy(buf, PEMagic, sizeof(PEMagic));
@@ -2311,7 +2322,7 @@ void Writer::writeBuildId() {
     debugDirectory->setTimeDateStamp(timestamp);
 
   uint8_t *buf = buffer->getBufferStart();
-  buf += dosStubSize + sizeof(PEMagic);
+  buf += useRich?dosStubSize_rich:dosStubSize + sizeof(PEMagic);
   object::coff_file_header *coffHeader =
       reinterpret_cast<coff_file_header *>(buf);
   coffHeader->TimeDateStamp = timestamp;
