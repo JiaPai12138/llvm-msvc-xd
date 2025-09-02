@@ -37,6 +37,8 @@ https://github.com/gmh5225/awesome-llvm-security#ollvm
 - [x] 新功能
 - [x] custom-cc 参数传递和返回值的方法
 - [x] anti-ida, copy from some other ollvm codes
+- [x] self build
+- [x] -rich for lld-link option to build pe with rich-header
 - [ ] new functions
 
 
