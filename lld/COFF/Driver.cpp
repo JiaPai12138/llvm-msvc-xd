@@ -2281,6 +2281,10 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   if (args.hasArg(OPT_release))
     config->writeCheckSum = true;
 
+  // Handle /rich
+  if (args.hasArg(OPT_rich))
+    config->useRich = true;
+
   run();
   if (errorCount())
     return;

@@ -49,7 +49,6 @@ using namespace lld;
 using namespace lld::coff;
 
 
-cl::opt<bool> useRich("rich", cl::desc("Enable rich header"));
 /* To re-generate DOSProgram:
 $ cat > /tmp/DOSProgram.asm
 org 0
@@ -739,7 +738,7 @@ void Writer::writePEChecksum() {
   uint32_t size = (uint32_t)(buffer->getBufferSize());
 
   coff_file_header *coffHeader =
-      (coff_file_header *)((uint8_t *)buf + useRich?dosStubSize_rich:dosStubSize + sizeof(PEMagic));
+      (coff_file_header *)((uint8_t *)buf + (ctx.config.useRich ? dosStubSize_rich : dosStubSize) + sizeof(PEMagic));
   pe32_header *peHeader =
       (pe32_header *)((uint8_t *)coffHeader + sizeof(coff_file_header));
   uint32_t oldCheckSum = peHeader->CheckSum;
@@ -1588,7 +1587,7 @@ void Writer::assignAddresses() {
   // We do it here to make sure that we account for range extension chunks.
   createECCodeMap();
 
-  sizeOfHeaders = useRich?dosStubSize_rich:dosStubSize + sizeof(PEMagic) + sizeof(coff_file_header) +
+  sizeOfHeaders = (ctx.config.useRich ? dosStubSize_rich : dosStubSize) + sizeof(PEMagic) + sizeof(coff_file_header) +
                   sizeof(data_directory) * numberOfDataDirectory +
                   sizeof(coff_section) * ctx.outputSections.size();
   sizeOfHeaders +=
@@ -1657,17 +1656,17 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   buf += sizeof(dos_header);
   dos->Magic[0] = 'M';
   dos->Magic[1] = 'Z';
-  dos->UsedBytesInTheLastPage = useRich?dosStubSize_rich:dosStubSize % 512;
+  dos->UsedBytesInTheLastPage = (ctx.config.useRich ? dosStubSize_rich : dosStubSize) % 512;
   dos->FileSizeInPages = 3;
   dos->HeaderSizeInParagraphs = sizeof(dos_header) / 16;
   dos->MaximumExtraParagraphs = 0xFFFF;
   dos->InitialSP = 0xB8;
   dos->AddressOfRelocationTable = sizeof(dos_header);
-  dos->AddressOfNewExeHeader = useRich?dosStubSize_rich:dosStubSize;
+  dos->AddressOfNewExeHeader = ctx.config.useRich ? dosStubSize_rich : dosStubSize;
 
   // Write DOS program.
-  memcpy(buf, useRich?dosProgram_rich:dosProgram, useRich?dosStubSize_rich:dosStubSize - sizeof(dos_header));
-  buf += useRich?dosStubSize_rich:dosStubSize - sizeof(dos_header);
+  memcpy(buf, ctx.config.useRich ? dosProgram_rich : dosProgram, (ctx.config.useRich ? dosStubSize_rich : dosStubSize) - sizeof(dos_header));
+  buf += (ctx.config.useRich ? dosStubSize_rich : dosStubSize) - sizeof(dos_header);
 
   // Write PE magic
   memcpy(buf, PEMagic, sizeof(PEMagic));
@@ -2322,7 +2321,7 @@ void Writer::writeBuildId() {
     debugDirectory->setTimeDateStamp(timestamp);
 
   uint8_t *buf = buffer->getBufferStart();
-  buf += useRich?dosStubSize_rich:dosStubSize + sizeof(PEMagic);
+  buf += (ctx.config.useRich ? dosStubSize_rich : dosStubSize) + sizeof(PEMagic);
   object::coff_file_header *coffHeader =
       reinterpret_cast<coff_file_header *>(buf);
   coffHeader->TimeDateStamp = timestamp;

@@ -162,6 +162,7 @@ def repro : F<"Brepro">,
 def reproduce : Joined<["/", "-", "/?", "-?"], "reproduce:">,
     MetaVarName<"filename">,
     HelpText<"Write tar file containing inputs and command to reproduce link">;
+def rich : F<"rich">, HelpText<"Enable rich header">;
 def swaprun : P<"swaprun",
   "Comma-separated list of 'cd' or 'net'">;
 def swaprun_cd : F<"swaprun:cd">, Alias<swaprun>, AliasArgs<["cd"]>,
