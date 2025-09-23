@@ -39,6 +39,7 @@ https://github.com/gmh5225/awesome-llvm-security#ollvm
 - [x] anti-ida, copy from some other ollvm codes
 - [x] self build
 - [x] -rich for lld-link option to build pe with rich-header
+- [x] -x-pic for -fPIC in windows (-mllvm -x-pic -mllvm -xpic-global -mllvm -xpic-memset -mllvm -xpic-memcpy)
 - [ ] new functions
 
 
