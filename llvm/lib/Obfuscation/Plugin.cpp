@@ -24,6 +24,7 @@
 #include <IndirectBranch.h>
 #include <CustomCC.h>
 #include <AntiIDA.h>
+#include <CodePicPass.h>
 
 using namespace llvm;
 
@@ -31,6 +32,16 @@ llvm::PassPluginLibraryInfo getObfuscationPluginInfo() {
   return {
       LLVM_PLUGIN_API_VERSION, "Obfuscation", LLVM_VERSION_STRING,
       [](PassBuilder &PB) {
+        PB.registerPipelineParsingCallback([](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
+          MPM.addPass(CodePicPass());
+          return true;
+        });
+        PB.registerPipelineParsingCallback(
+                [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
+                  FPM.addPass(CodePicPass());
+                  return true;
+                });
+
         PB.registerPipelineStartEPCallback([](llvm::ModulePassManager &MPM,
                                               OptimizationLevel Level) {
 
@@ -42,6 +53,8 @@ llvm::PassPluginLibraryInfo getObfuscationPluginInfo() {
           MPM.addPass(createModuleToFunctionPassAdaptor(FlatteningPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(VmProtectPass()));
           
+          MPM.addPass(CodePicPass());
+          MPM.addPass(createModuleToFunctionPassAdaptor(CodePicPass()));
 
         });
         PB.registerOptimizerEarlyEPCallback([](llvm::ModulePassManager &MPM,

@@ -32,6 +32,8 @@
 #include "llvm/Support/RandomNumberGenerator.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/xxhash.h"
+#include "llvm/Support/CommandLine.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <map>
@@ -45,6 +47,7 @@ using namespace llvm::support;
 using namespace llvm::support::endian;
 using namespace lld;
 using namespace lld::coff;
+
 
 /* To re-generate DOSProgram:
 $ cat > /tmp/DOSProgram.asm
@@ -66,18 +69,44 @@ align 8, db 0
 $ nasm -fbin /tmp/DOSProgram.asm -o /tmp/DOSProgram.bin
 $ xxd -i /tmp/DOSProgram.bin
 */
+
+static unsigned char dosProgram_rich[] = {
+  0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
+  0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72,
+  0x61, 0x6d, 0x20, 0x63, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x20, 0x62, 0x65,
+  0x20, 0x72, 0x75, 0x6e, 0x20, 0x69, 0x6e, 0x20, 0x44, 0x4f, 0x53, 0x20,
+  0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x0d, 0x0d, 0x0a, 0x24, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x37, 0xA7, 0xBA, 0x33, 0x73, 0xC6, 0xD4, 0x60,
+  0x73, 0xC6, 0xD4, 0x60, 0x73, 0xC6, 0xD4, 0x60, 0x73, 0xC6, 0xD4, 0x60,
+  0x71, 0xC6, 0xD4, 0x60, 0x07, 0x47, 0xD4, 0x61, 0x72, 0xC6, 0xD4, 0x60, 
+  0x07, 0x47, 0xD7, 0x61, 0x5C, 0xC6, 0xD4, 0x60, 0x07, 0x47, 0xD0, 0x61, 
+  0x0C, 0xC6, 0xD4, 0x60, 0x07, 0x47, 0xDC, 0x61, 0x3A, 0xC7, 0xD4, 0x60, 
+  0x07, 0x47, 0xD1, 0x61, 0x6D, 0xC6, 0xD4, 0x60, 0x07, 0x47, 0x2B, 0x60,
+  0x72, 0xC6, 0xD4, 0x60, 0x07, 0x47, 0xD6, 0x61, 0x72, 0xC6, 0xD4, 0x60, 
+  0x52, 0x69, 0x63, 0x68, 0x73, 0xC6, 0xD4, 0x60, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static_assert(sizeof(dosProgram_rich) % 8 == 0,
+              "DOSProgram size must be multiple of 8");
+
 static unsigned char dosProgram[] = {
   0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
   0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72,
   0x61, 0x6d, 0x20, 0x63, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x20, 0x62, 0x65,
   0x20, 0x72, 0x75, 0x6e, 0x20, 0x69, 0x6e, 0x20, 0x44, 0x4f, 0x53, 0x20,
-  0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x24, 0x00, 0x00
+  0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x0d, 0x0d, 0x0a
 };
+
 static_assert(sizeof(dosProgram) % 8 == 0,
               "DOSProgram size must be multiple of 8");
 
 static const int dosStubSize = sizeof(dos_header) + sizeof(dosProgram);
 static_assert(dosStubSize % 8 == 0, "DOSStub size must be multiple of 8");
+
+static const int dosStubSize_rich = sizeof(dos_header) + sizeof(dosProgram_rich);
+static_assert(dosStubSize_rich % 8 == 0, "DOSStub size must be multiple of 8");
+
 
 static const int numberOfDataDirectory = 16;
 
@@ -709,7 +738,7 @@ void Writer::writePEChecksum() {
   uint32_t size = (uint32_t)(buffer->getBufferSize());
 
   coff_file_header *coffHeader =
-      (coff_file_header *)((uint8_t *)buf + dosStubSize + sizeof(PEMagic));
+      (coff_file_header *)((uint8_t *)buf + (ctx.config.useRich ? dosStubSize_rich : dosStubSize) + sizeof(PEMagic));
   pe32_header *peHeader =
       (pe32_header *)((uint8_t *)coffHeader + sizeof(coff_file_header));
   uint32_t oldCheckSum = peHeader->CheckSum;
@@ -1558,7 +1587,7 @@ void Writer::assignAddresses() {
   // We do it here to make sure that we account for range extension chunks.
   createECCodeMap();
 
-  sizeOfHeaders = dosStubSize + sizeof(PEMagic) + sizeof(coff_file_header) +
+  sizeOfHeaders = (ctx.config.useRich ? dosStubSize_rich : dosStubSize) + sizeof(PEMagic) + sizeof(coff_file_header) +
                   sizeof(data_directory) * numberOfDataDirectory +
                   sizeof(coff_section) * ctx.outputSections.size();
   sizeOfHeaders +=
@@ -1627,17 +1656,17 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   buf += sizeof(dos_header);
   dos->Magic[0] = 'M';
   dos->Magic[1] = 'Z';
-  dos->UsedBytesInTheLastPage = dosStubSize % 512;
+  dos->UsedBytesInTheLastPage = (ctx.config.useRich ? dosStubSize_rich : dosStubSize) % 512;
   dos->FileSizeInPages = 3;
   dos->HeaderSizeInParagraphs = sizeof(dos_header) / 16;
   dos->MaximumExtraParagraphs = 0xFFFF;
   dos->InitialSP = 0xB8;
   dos->AddressOfRelocationTable = sizeof(dos_header);
-  dos->AddressOfNewExeHeader = dosStubSize;
+  dos->AddressOfNewExeHeader = ctx.config.useRich ? dosStubSize_rich : dosStubSize;
 
   // Write DOS program.
-  memcpy(buf, dosProgram, sizeof(dosProgram));
-  buf += sizeof(dosProgram);
+  memcpy(buf, ctx.config.useRich ? dosProgram_rich : dosProgram, (ctx.config.useRich ? dosStubSize_rich : dosStubSize) - sizeof(dos_header));
+  buf += (ctx.config.useRich ? dosStubSize_rich : dosStubSize) - sizeof(dos_header);
 
   // Write PE magic
   memcpy(buf, PEMagic, sizeof(PEMagic));
@@ -2293,7 +2322,7 @@ void Writer::writeBuildId() {
     debugDirectory->setTimeDateStamp(timestamp);
 
   uint8_t *buf = buffer->getBufferStart();
-  buf += dosStubSize + sizeof(PEMagic);
+  buf += (ctx.config.useRich ? dosStubSize_rich : dosStubSize) + sizeof(PEMagic);
   object::coff_file_header *coffHeader =
       reinterpret_cast<coff_file_header *>(buf);
   coffHeader->TimeDateStamp = timestamp;

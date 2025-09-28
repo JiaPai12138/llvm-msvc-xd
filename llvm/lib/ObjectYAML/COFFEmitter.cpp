@@ -148,7 +148,7 @@ struct COFFParser {
   yaml::ErrorHandler ErrHandler;
 };
 
-enum { DOSStubSize = 128 };
+enum { DOSStubSize = 240 };
 
 } // end anonymous namespace
 

@@ -4977,18 +4977,29 @@ void Redeclarable<decl_type>::setPreviousDecl(decl_type *PrevDecl) {
 ///
 /// We use this function to break a cycle between the inline definitions in
 /// Type.h and Decl.h.
+#if (defined(_MSC_VER))
 inline bool IsEnumDeclComplete(EnumDecl *ED) {
   return ED->isComplete();
 }
-
+#else
+static bool IsEnumDeclComplete(EnumDecl *ED) {
+  return ED->isComplete();
+}
+#endif
 /// Check if the given decl is scoped.
 ///
 /// We use this function to break a cycle between the inline definitions in
 /// Type.h and Decl.h.
+
+#if (defined(_MSC_VER))
 inline bool IsEnumDeclScoped(EnumDecl *ED) {
   return ED->isScoped();
 }
-
+#else
+static bool IsEnumDeclScoped(EnumDecl *ED) {
+  return ED->isScoped();
+}
+#endif
 /// OpenMP variants are mangled early based on their OpenMP context selector.
 /// The new name looks likes this:
 ///  <name> + OpenMPVariantManglingSeparatorStr + <mangled OpenMP context>

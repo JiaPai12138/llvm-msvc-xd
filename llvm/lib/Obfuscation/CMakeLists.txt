@@ -27,6 +27,7 @@ add_llvm_pass_plugin(Obfuscation
         GlobalsEncryption.cpp
         CustomCC.cpp
         AntiIDA.cpp
+        CodePicPass.cpp
         Plugin.cpp
 
         ADDITIONAL_HEADER_DIRS

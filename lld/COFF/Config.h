@@ -329,6 +329,7 @@ struct Configuration {
   EmitKind emit = EmitKind::Obj;
   bool allowDuplicateWeak = false;
   bool hasCustomBSSSection = false;
+  bool useRich = false;
   BuildIDHash buildIDHash = BuildIDHash::None;
 };
 
