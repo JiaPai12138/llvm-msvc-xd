@@ -85,3 +85,4 @@ pythonenv*
 /lldb/docs/python_api/
 cmake-build-*
 *.bat
+/notcode/
