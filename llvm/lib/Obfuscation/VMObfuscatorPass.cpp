@@ -1032,11 +1032,6 @@ bool VmObfuscatorPass::translateInstruction(Instruction &I) {
       } else if (name.starts_with("llvm.assume")) {
         // Ignore assume intrinsics
         return true;
-      } else if (name.starts_with("llvm.va_start") ||
-                 name.starts_with("llvm.va_end") ||
-                 name.starts_with("llvm.va_copy")) {
-        // Ignore variadic argument intrinsics
-        return true;
       } else if (name.starts_with("llvm.smin") ||
                  name.starts_with("llvm.umin") ||
                  name.starts_with("llvm.smax") ||
@@ -1285,11 +1280,6 @@ PreservedAnalyses VmObfuscatorPass::run(Module &M, ModuleAnalysisManager &MAM) {
                          iname.starts_with("llvm.dbg.") ||
                          iname.starts_with("llvm.assume")) {
                 // Ignore these intrinsics during scan
-                continue;
-              } else if (iname.starts_with("llvm.va_start") ||
-                         iname.starts_with("llvm.va_end") ||
-                         iname.starts_with("llvm.va_copy")) {
-                // Ignore variadic argument intrinsics
                 continue;
               } else {
                 report_fatal_error(
