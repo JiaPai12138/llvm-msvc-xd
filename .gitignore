@@ -85,3 +85,5 @@ pythonenv*
 /lldb/docs/python_api/
 cmake-build-*
 *.bat
+/notcode/
+llvm/lib/Obfuscation/vmlib/vm_routine.c
