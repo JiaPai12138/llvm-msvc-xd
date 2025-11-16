@@ -11,6 +11,7 @@ add_llvm_pass_plugin(Obfuscation
         MBAObfuscation.cpp
         ConstObfuscation.cpp
         DataObfuscation.cpp
+        VMObfuscatorPass.cpp
         VMFlatten.cpp
         xVMProtect.cpp
         xVMTranslator.cpp
