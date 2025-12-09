@@ -9,6 +9,8 @@ add_llvm_pass_plugin(Obfuscation
         IndirectGlobalVars.cpp
         StringObfuscation.cpp
         MBAObfuscation.cpp
+        MBAMatrix.cpp
+        LinearMBA.cpp
         ConstObfuscation.cpp
         DataObfuscation.cpp
         VMObfuscatorPass.cpp

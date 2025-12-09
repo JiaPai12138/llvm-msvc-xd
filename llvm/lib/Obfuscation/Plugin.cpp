@@ -8,6 +8,7 @@
 #include "IndirectCall.h"
 #include "IndirectGlobalVars.h"
 #include "Linearize.h"
+#include "LinearMBA.h"
 #include "MBAObfuscation.h"
 #include "SplitBasicBlock.h"
 #include "StringObfuscation.h"
@@ -51,6 +52,7 @@ llvm::PassPluginLibraryInfo getObfuscationPluginInfo() {
               createModuleToFunctionPassAdaptor(BogusControlFlowPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(SubstitutionPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(MBAObfuscationPass()));
+          MPM.addPass(createModuleToFunctionPassAdaptor(LinearMBAPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(FlatteningPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(VmProtectPass()));
           
