@@ -1681,6 +1681,11 @@ bool TargetLoweringBase::isSuitableForJumpTable(const SwitchInst *SI,
                                                 uint64_t Range,
                                                 ProfileSummaryInfo *PSI,
                                                 BlockFrequencyInfo *BFI) const {
+  // Check if jump tables are disabled via function attribute.
+  const Function *Fn = SI->getParent()->getParent();
+  if (Fn->getFnAttribute("no-jump-tables").getValueAsBool())
+    return false;
+                                  
   // FIXME: This function check the maximum table size and density, but the
   // minimum size is not checked. It would be nice if the minimum size is
   // also combined within this function. Currently, the minimum size check is
@@ -1692,6 +1697,10 @@ bool TargetLoweringBase::isSuitableForJumpTable(const SwitchInst *SI,
   const unsigned MinDensity = getMinimumJumpTableDensity(OptForSize);
   const unsigned MaxJumpTableSize = getMaximumJumpTableSize();
 
+  if (NumCases < MinDensity)
+    return false;
+  if (Range > MaxJumpTableSize)
+    return false;
   // Check whether the number of cases is small enough and
   // the range is dense enough for a jump table.
   return (OptForSize || Range <= MaxJumpTableSize) &&
