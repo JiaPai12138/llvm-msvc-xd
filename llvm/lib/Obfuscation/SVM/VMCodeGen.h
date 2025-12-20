@@ -10,7 +10,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
-#include "llvm/Obfuscation/Utils.h"
+#include "../Utils.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
