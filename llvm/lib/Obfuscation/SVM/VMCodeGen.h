@@ -90,7 +90,7 @@ public:
     Tool(tool), PtrSize(DL.getPointerSize()) {}
 
   void run() {
-    uint64_t seed = hashName(F.getName());
+    uint64_t seed = makeSeed(F);
     Code.clear();
     Instrs.clear();
     IpHashSet.clear();
@@ -203,6 +203,16 @@ private:
       h ^= static_cast<uint8_t>(c);
       h *= 1099511628211ULL;
     }
+    return h ? h : 0x9e3779b97f4a7c15ULL;
+  }
+
+  static uint64_t makeSeed(const llvm::Function &F) {
+    uint64_t h = hashName(F.getName());
+    h ^= hashName(F.getParent()->getModuleIdentifier());
+    h ^= rotl64(static_cast<uint64_t>(F.getGUID()), 13) * PRIME3;
+    h ^= (h >> 29);
+    h *= PRIME4;
+    h ^= (h >> 32);
     return h ? h : 0x9e3779b97f4a7c15ULL;
   }
 
