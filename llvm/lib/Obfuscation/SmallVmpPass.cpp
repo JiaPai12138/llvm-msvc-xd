@@ -30,6 +30,8 @@ PreservedAnalyses SmallVmpPass::run(Module &M, ModuleAnalysisManager &AM) {
   // Check if any function needs processing
   bool hasCandidate = false;
 
+  srand(time(nullptr));
+  
   if (RunSmallVmp) {
     hasCandidate = true;
   } else {
