@@ -10,6 +10,7 @@
 #include "Linearize.h"
 #include "LinearMBA.h"
 #include "MBAObfuscation.h"
+#include "SmallVmpPass.h"
 #include "SplitBasicBlock.h"
 #include "StringObfuscation.h"
 #include "Substitution.h"
@@ -46,6 +47,7 @@ llvm::PassPluginLibraryInfo getObfuscationPluginInfo() {
 
         PB.registerPipelineStartEPCallback([](llvm::ModulePassManager &MPM,
                                               OptimizationLevel Level) {
+          MPM.addPass(SmallVmpPass());
           MPM.addPass(VmObfuscatorPass());
           MPM.addPass(createModuleToFunctionPassAdaptor(SplitBasicBlockPass()));
           MPM.addPass(
