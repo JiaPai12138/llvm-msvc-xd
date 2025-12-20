@@ -137,7 +137,16 @@ private:
   llvm::FunctionCallee getHandleCall() {
     // uint64_t handle_call(uint64_t id, void** args, uint64_t num)
     auto *FT = llvm::FunctionType::get(I64Ty, {I64Ty, PtrTy, I64Ty}, false);
-    return M.getOrInsertFunction("handle_call", FT);
+    auto Callee = M.getOrInsertFunction("handle_call", FT);
+    if (auto *F = llvm::dyn_cast<llvm::Function>(Callee.getCallee())) {
+      if (F->empty()) {
+        F->setLinkage(llvm::GlobalValue::InternalLinkage);
+        llvm::BasicBlock *BB = llvm::BasicBlock::Create(Ctx, "entry", F);
+        llvm::IRBuilder<> B(BB);
+        B.CreateRet(llvm::ConstantInt::get(I64Ty, 0));
+      }
+    }
+    return Callee;
   }
 
   void generateBody(llvm::Function *F,

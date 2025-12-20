@@ -148,8 +148,8 @@ public:
       S.NumRewritten++;
     }
 
-    // Materialize handle_call
-    (void)handleTool.materializeHandle(M);
+    // Materialize handle_call (stub if empty) to satisfy vm_exec references.
+    (void)handleTool.materializeHandle(M, /*forceCreateStubIfEmpty=*/true);
 
     return (S.NumRewritten > 0);
   }

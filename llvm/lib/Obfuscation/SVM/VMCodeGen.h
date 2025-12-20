@@ -117,6 +117,14 @@ private:
 
   llvm::SmallPtrSet<const llvm::Value*, 16> ConstPtrDone;
 
+  static uint32_t slotSizeForType(const llvm::DataLayout &DL, llvm::Type *Ty) {
+    uint64_t sz = DL.getTypeAllocSize(Ty);
+    if (sz < 8) sz = 8;
+    return static_cast<uint32_t>(sz);
+  }
+
+  static uint32_t align8(uint32_t v) { return (v + 7u) & ~7u; }
+
   // Expand ConstantExpr to instructions
   void expandConstantExprs() {
     for (auto &BB : F) {
@@ -141,7 +149,7 @@ private:
     ParamMap.clear();
     for (auto &A : F.args()) {
       uint32_t off = allocSlot(&A, A.getType());
-      uint32_t sz  = (uint32_t)DL.getTypeAllocSize(A.getType());
+      uint32_t sz  = slotSizeForType(DL, A.getType());
       ParamMap.push_back({off, sz});
     }
   }
@@ -154,9 +162,10 @@ private:
 
   uint32_t allocSlot(const llvm::Value* V, llvm::Type* Ty) {
     if (auto it = SlotOf.find(V); it!=SlotOf.end()) return it->second;
+    CurrDataOffset = align8(CurrDataOffset);
     uint32_t off = CurrDataOffset;
-    uint64_t sz  = DL.getTypeAllocSize(Ty);
-    CurrDataOffset += (uint32_t)sz;
+    uint32_t sz  = slotSizeForType(DL, Ty);
+    CurrDataOffset += sz;
     SlotOf[V] = off;
     return off;
   }
@@ -200,9 +209,9 @@ private:
         uint64_t bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
         p64(Code, bits); return;
       } else if (CF->getType()->isFloatTy()) {
-        p8(Code, VT_CONST); p8(Code, CK_F32); p32(Code, 4);
+        p8(Code, VT_CONST); p8(Code, CK_F32); p32(Code, 8);
         uint32_t bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
-        p32(Code, bits); return;
+        p64(Code, (uint64_t)bits); return;
       }
     }
 
@@ -250,7 +259,7 @@ private:
 
   void t_allo(llvm::AllocaInst &I) {
     uint32_t res_off = allocSlot(&I, I.getType());
-    uint64_t area_sz = DL.getTypeAllocSize(I.getAllocatedType());
+    uint64_t area_sz = slotSizeForType(DL, I.getAllocatedType());
     p8(Code, OP_ALLOCA); p32(Code, res_off); p32(Code, (uint32_t)area_sz);
   }
 
