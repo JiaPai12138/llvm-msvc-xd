@@ -88,4 +88,5 @@ cmake-build-*
 /notcode/
 llvm/lib/Obfuscation/vmlib/vm_routine.c
 /tests/
+/docs/
 CLAUDE.md
