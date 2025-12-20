@@ -10,6 +10,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Obfuscation/Utils.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
@@ -207,8 +208,8 @@ private:
   }
 
   static uint64_t makeSeed(const llvm::Function &F) {
-    uint64_t h = hashName(F.getName());
-    h ^= hashName(F.getParent()->getModuleIdentifier());
+    uint64_t h = getRandomNumber();
+    h ^= hashName(F.getName());
     h ^= rotl64(static_cast<uint64_t>(F.getGUID()), 13) * PRIME3;
     h ^= (h >> 29);
     h *= PRIME4;
