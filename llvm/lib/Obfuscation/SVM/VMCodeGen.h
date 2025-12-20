@@ -5,18 +5,23 @@
 #include "SVM/HandleCallTool.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <vector>
 #include <map>
+#include <unordered_set>
 #include <optional>
 #include <cassert>
 #include <cstdint>
+
+//#define SVM_CODEGEN_DEBUG 1
 
 namespace vmp {
 
@@ -51,6 +56,9 @@ enum : uint8_t { TK_INT=0, TK_FP=1 };
 
 // Little-endian packing
 static inline void p8 (std::vector<uint8_t>& out, uint8_t v)  { out.push_back(v); }
+static inline void p16(std::vector<uint8_t>& out, uint16_t v) {
+  out.push_back(uint8_t(v      )); out.push_back(uint8_t(v>>8));
+}
 static inline void p32(std::vector<uint8_t>& out, uint32_t v) {
   out.push_back(uint8_t(v      )); out.push_back(uint8_t(v>>8));
   out.push_back(uint8_t(v>>16 )); out.push_back(uint8_t(v>>24));
@@ -82,6 +90,12 @@ public:
     Tool(tool), PtrSize(DL.getPointerSize()) {}
 
   void run() {
+    uint64_t seed = hashName(F.getName());
+    Code.clear();
+    Instrs.clear();
+    IpHashSet.clear();
+    p64(Code, seed);
+
     expandConstantExprs();
     enterFunction();
     emitParamMap();
@@ -90,6 +104,9 @@ public:
       for (auto &I : BB) translateInst(I);
     }
     patchBranches();
+    refreshCrcs();
+    buildIpHashSet();
+    encryptInstructions(seed);
   }
 
   const std::vector<uint8_t>& code() const { return Code; }
@@ -106,6 +123,10 @@ private:
   unsigned PtrSize;
 
   std::vector<uint8_t> Code;
+  std::vector<uint8_t> CurInst;
+  struct InstrSlice { uint32_t off; uint32_t len; };
+  std::vector<InstrSlice> Instrs;
+  std::unordered_set<uint32_t> IpHashSet;
   std::map<const llvm::Value*, uint32_t>       SlotOf;
   std::map<const llvm::BasicBlock*, uint32_t>  AddrOfBB;
   struct Fixup { uint32_t pos; const llvm::BasicBlock* target; };
@@ -117,6 +138,11 @@ private:
 
   llvm::SmallPtrSet<const llvm::Value*, 16> ConstPtrDone;
 
+  static constexpr uint32_t kSeedBytes = 8;
+  static constexpr uint32_t kLenBytes = 2;
+  static constexpr uint32_t kCrcBytes = 2;
+  static constexpr uint32_t kHdrBytes = kLenBytes + kCrcBytes;
+
   static uint32_t slotSizeForType(const llvm::DataLayout &DL, llvm::Type *Ty) {
     uint64_t sz = DL.getTypeAllocSize(Ty);
     if (sz < 8) sz = 8;
@@ -124,6 +150,79 @@ private:
   }
 
   static uint32_t align8(uint32_t v) { return (v + 7u) & ~7u; }
+
+  static inline uint64_t rotl64(uint64_t x, unsigned r) {
+    return (x << r) | (x >> (64 - r));
+  }
+
+  static constexpr uint64_t PRIME1 = 11400714785074694791ULL;
+  static constexpr uint64_t PRIME2 = 14029467366897019727ULL;
+  static constexpr uint64_t PRIME3 = 1609587929392839161ULL;
+  static constexpr uint64_t PRIME4 = 9650029242287828579ULL;
+  static constexpr uint64_t PRIME5 = 2870177450012600261ULL;
+
+  static inline uint64_t mixKey(uint64_t prev, uint64_t ip,
+                                uint8_t opcode, uint16_t len) {
+    uint64_t k = prev + PRIME1;
+    k ^= ip * PRIME2;
+    k ^= (uint64_t)opcode * PRIME3;
+    k ^= (uint64_t)len * PRIME4;
+    k = rotl64(k, 31) * PRIME1;
+    k ^= k >> 33; k *= PRIME2; k ^= k >> 29; k *= PRIME3; k ^= k >> 32;
+    return k;
+  }
+
+  static inline uint64_t hashSeedIp(uint64_t seed, uint64_t ip) {
+    uint64_t k = seed + PRIME1;
+    k ^= ip * PRIME2;
+    k = rotl64(k, 31) * PRIME1;
+    k ^= k >> 33; k *= PRIME2; k ^= k >> 29; k *= PRIME3; k ^= k >> 32;
+    return k;
+  }
+
+  static inline uint8_t nextStreamByte(uint64_t &state) {
+    state = rotl64(state + PRIME5, 17) * PRIME1;
+    return static_cast<uint8_t>(state & 0xFF);
+  }
+
+  static uint16_t crc16_ccitt(const uint8_t *data, uint32_t len) {
+    uint16_t crc = 0xFFFFu;
+    for (uint32_t i = 0; i < len; ++i) {
+      crc ^= (uint16_t)(data[i] << 8);
+      for (int b = 0; b < 8; ++b) {
+        crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u)
+                              : (uint16_t)(crc << 1);
+      }
+    }
+    return crc;
+  }
+
+  static uint64_t hashName(llvm::StringRef S) {
+    uint64_t h = 1469598103934665603ULL;
+    for (char c : S) {
+      h ^= static_cast<uint8_t>(c);
+      h *= 1099511628211ULL;
+    }
+    return h ? h : 0x9e3779b97f4a7c15ULL;
+  }
+
+  void beginInst() { CurInst.clear(); }
+
+  void endInst() {
+    uint32_t len = static_cast<uint32_t>(CurInst.size());
+    assert(len <= 0xFFFF && "instruction too large for u16 length");
+    uint32_t off = static_cast<uint32_t>(Code.size());
+    p16(Code, static_cast<uint16_t>(len));
+    uint16_t crc = crc16_ccitt(CurInst.data(), len);
+    p16(Code, crc);
+    Code.insert(Code.end(), CurInst.begin(), CurInst.end());
+    Instrs.push_back({off, static_cast<uint32_t>(kHdrBytes + len)});
+  }
+
+  void emit8(uint8_t v)  { p8(CurInst, v); }
+  void emit16(uint16_t v){ p16(CurInst, v); }
+  void emit32(uint32_t v){ p32(CurInst, v); }
+  void emit64(uint64_t v){ p64(CurInst, v); }
 
   // Expand ConstantExpr to instructions
   void expandConstantExprs() {
@@ -155,9 +254,11 @@ private:
   }
 
   void emitParamMap() {
-    p8(Code, OP_PARAMMAP);
-    p32(Code, (uint32_t)ParamMap.size());
-    for (auto &pd : ParamMap) { p32(Code, pd.off); p32(Code, pd.size); }
+    beginInst();
+    emit8(OP_PARAMMAP);
+    emit32((uint32_t)ParamMap.size());
+    for (auto &pd : ParamMap) { emit32(pd.off); emit32(pd.size); }
+    endInst();
   }
 
   uint32_t allocSlot(const llvm::Value* V, llvm::Type* Ty) {
@@ -179,10 +280,13 @@ private:
       uint64_t kid = Tool.ensureConstAddrId(C8);
       uint32_t dst = allocSlot(V, V->getType());
 
-      p8(Code, OP_CALL);
-      p64(Code, kid);
-      p32(Code, dst);
-      p32(Code, 0);
+      assert(CurInst.empty() && "materializeConstPtrIfPossible must be called before beginInst()");
+      beginInst();
+      emit8(OP_CALL);
+      emit64(kid);
+      emit32(dst);
+      emit32(0);
+      endInst();
 
       ConstPtrDone.insert(V);
     }
@@ -192,36 +296,35 @@ private:
     using namespace llvm;
 
     if (V->getType()->isPointerTy()) {
-      materializeConstPtrIfPossible(V);
       uint32_t off = allocSlot(V, V->getType());
-      p8(Code, VT_SLOT); p32(Code, off);
+      emit8(VT_SLOT); emit32(off);
       return;
     }
 
     if (auto *CI = dyn_cast<ConstantInt>(V)) {
-      p8(Code, VT_CONST); p8(Code, CK_INT);
+      emit8(VT_CONST); emit8(CK_INT);
       uint64_t v = CI->getValue().zextOrTrunc(64).getZExtValue();
-      p32(Code, 8); p64(Code, v); return;
+      emit32(8); emit64(v); return;
     }
     if (auto *CF = dyn_cast<ConstantFP>(V)) {
       if (CF->getType()->isDoubleTy()) {
-        p8(Code, VT_CONST); p8(Code, CK_F64); p32(Code, 8);
+        emit8(VT_CONST); emit8(CK_F64); emit32(8);
         uint64_t bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
-        p64(Code, bits); return;
+        emit64(bits); return;
       } else if (CF->getType()->isFloatTy()) {
-        p8(Code, VT_CONST); p8(Code, CK_F32); p32(Code, 8);
+        emit8(VT_CONST); emit8(CK_F32); emit32(8);
         uint32_t bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
-        p64(Code, (uint64_t)bits); return;
+        emit64((uint64_t)bits); return;
       }
     }
 
     if (isa<Constant>(V)) {
       uint32_t off = allocSlot(V, V->getType());
-      p8(Code, VT_SLOT); p32(Code, off); return;
+      emit8(VT_SLOT); emit32(off); return;
     }
 
     uint32_t off = allocSlot(V, V->getType());
-    p8(Code, VT_SLOT); p32(Code, off);
+    emit8(VT_SLOT); emit32(off);
   }
 
   void markBB(const llvm::BasicBlock* BB) { AddrOfBB[BB] = (uint32_t)Code.size(); }
@@ -260,14 +363,18 @@ private:
   void t_allo(llvm::AllocaInst &I) {
     uint32_t res_off = allocSlot(&I, I.getType());
     uint64_t area_sz = slotSizeForType(DL, I.getAllocatedType());
-    p8(Code, OP_ALLOCA); p32(Code, res_off); p32(Code, (uint32_t)area_sz);
+    beginInst();
+    emit8(OP_ALLOCA); emit32(res_off); emit32((uint32_t)area_sz);
+    endInst();
   }
 
   void t_load(llvm::LoadInst &I) {
     materializeConstPtrIfPossible(I.getPointerOperand());
     uint32_t dst = allocSlot(&I, I.getType());
-    p8(Code, OP_LOAD); p32(Code, dst);
+    beginInst();
+    emit8(OP_LOAD); emit32(dst);
     encodeValue(I.getPointerOperand());
+    endInst();
   }
 
   void t_store(llvm::StoreInst &I) {
@@ -275,9 +382,11 @@ private:
       materializeConstPtrIfPossible(I.getValueOperand());
     materializeConstPtrIfPossible(I.getPointerOperand());
 
-    p8(Code, OP_STORE);
+    beginInst();
+    emit8(OP_STORE);
     encodeValue(I.getValueOperand());
     encodeValue(I.getPointerOperand());
+    endInst();
   }
 
   struct ArithEnc { uint8_t sub; uint8_t tk; uint8_t bits; };
@@ -319,35 +428,46 @@ private:
   }
 
   void t_binop(llvm::BinaryOperator &I) {
+    materializeConstPtrIfPossible(I.getOperand(0));
+    materializeConstPtrIfPossible(I.getOperand(1));
     auto Enc = mapLLVMArith(I);
     if (!Enc) { llvm::errs() << "[VMCodeGen] unsupported binop for ARITH: " << I << "\n"; return; }
     uint32_t dst = allocSlot(&I, I.getType());
-    p8(Code, OP_ARITH); p8(Code, Enc->sub); p8(Code, Enc->tk); p8(Code, Enc->bits);
-    p32(Code, dst);
+    beginInst();
+    emit8(OP_ARITH); emit8(Enc->sub); emit8(Enc->tk); emit8(Enc->bits);
+    emit32(dst);
     encodeValue(I.getOperand(0));
     encodeValue(I.getOperand(1));
+    endInst();
   }
 
   void t_cmp(llvm::CmpInst &I) {
+    materializeConstPtrIfPossible(I.getOperand(0));
+    materializeConstPtrIfPossible(I.getOperand(1));
     uint32_t dst = allocSlot(&I, I.getType());
-    p8(Code, OP_CMP);
-    p8(Code, (uint8_t)I.getPredicate());
-    p32(Code, dst);
+    beginInst();
+    emit8(OP_CMP);
+    emit8((uint8_t)I.getPredicate());
+    emit32(dst);
     encodeValue(I.getOperand(0));
     encodeValue(I.getOperand(1));
+    endInst();
   }
 
   void t_cast(llvm::CastInst &I) {
+    materializeConstPtrIfPossible(I.getOperand(0));
     if (I.getType()->isPointerTy()) {
       materializeConstPtrIfPossible(&I);
       if (ConstPtrDone.count(&I)) return;
     }
 
     uint32_t dst = allocSlot(&I, I.getType());
-    p8(Code, OP_CAST);
-    p8(Code, (uint8_t)I.getOpcode());
-    p32(Code, dst);
+    beginInst();
+    emit8(OP_CAST);
+    emit8((uint8_t)I.getOpcode());
+    emit32(dst);
     encodeValue(I.getOperand(0));
+    endInst();
   }
 
   void t_gep(llvm::GetElementPtrInst &I) {
@@ -357,49 +477,63 @@ private:
     materializeConstPtrIfPossible(I.getPointerOperand());
 
     uint32_t dst = allocSlot(&I, I.getType());
-    p8(Code, OP_GEP);
-    p32(Code, dst);
+    beginInst();
+    emit8(OP_GEP);
+    emit32(dst);
     encodeValue(I.getPointerOperand());
     unsigned n = I.getNumIndices();
-    p32(Code, n);
+    emit32(n);
     for (auto Idx = I.idx_begin(); Idx != I.idx_end(); ++Idx) encodeValue(*Idx);
+    endInst();
   }
 
   void t_br(llvm::BranchInst &I) {
-    p8(Code, OP_BR);
+    beginInst();
+    emit8(OP_BR);
     if (I.isUnconditional()) {
-      p8(Code, 0);
-      uint32_t pos = (uint32_t)Code.size(); p32(Code, 0);
+      emit8(0);
+      uint32_t pos = (uint32_t)Code.size() + kHdrBytes + (uint32_t)CurInst.size();
+      emit32(0);
       BrFixups.push_back({pos, I.getSuccessor(0)});
     } else {
-      p8(Code, 1);
+      emit8(1);
       encodeValue(I.getCondition());
-      uint32_t posT = (uint32_t)Code.size(); p32(Code, 0);
+      uint32_t posT = (uint32_t)Code.size() + kHdrBytes + (uint32_t)CurInst.size();
+      emit32(0);
       BrFixups.push_back({posT, I.getSuccessor(0)});
-      uint32_t posF = (uint32_t)Code.size(); p32(Code, 0);
+      uint32_t posF = (uint32_t)Code.size() + kHdrBytes + (uint32_t)CurInst.size();
+      emit32(0);
       BrFixups.push_back({posF, I.getSuccessor(1)});
     }
+    endInst();
   }
 
   void t_ret(llvm::ReturnInst &I) {
-    p8(Code, OP_RET);
+    if (I.getNumOperands() != 0)
+      materializeConstPtrIfPossible(I.getReturnValue());
+    beginInst();
+    emit8(OP_RET);
     if (I.getNumOperands()==0) {
-      p8(Code, VT_CONST); p8(Code, CK_INT); p32(Code, 8); p64(Code, 0);
+      emit8(VT_CONST); emit8(CK_INT); emit32(8); emit64(0);
     } else {
       encodeValue(I.getReturnValue());
     }
+    endInst();
   }
 
   void t_call(llvm::CallBase &CB) {
+    for (unsigned i=0;i<CB.arg_size();++i)
+      materializeConstPtrIfPossible(CB.getArgOperand(i));
     uint64_t id = Tool.ensureCallId(&CB);
-    p8(Code, OP_CALL);
-    p64(Code, id);
+    beginInst();
+    emit8(OP_CALL);
+    emit64(id);
 
     if (!CB.getType()->isVoidTy()) {
       uint32_t dst = allocSlot(&CB, CB.getType());
-      p32(Code, dst);
+      emit32(dst);
     } else {
-      p32(Code, UINT32_C(0xFFFFFFFF));
+      emit32(UINT32_C(0xFFFFFFFF));
     }
 
     std::vector<uint32_t> dynOffs;
@@ -410,8 +544,9 @@ private:
       dynOffs.push_back( allocSlot(A, A->getType()) );
     }
 
-    p32(Code, (uint32_t)dynOffs.size());
-    for (uint32_t off : dynOffs) p32(Code, off);
+    emit32((uint32_t)dynOffs.size());
+    for (uint32_t off : dynOffs) emit32(off);
+    endInst();
   }
 
   void patchBranches() {
@@ -423,6 +558,65 @@ private:
       Code[fx.pos+1] = uint8_t(addr>>8);
       Code[fx.pos+2] = uint8_t(addr>>16);
       Code[fx.pos+3] = uint8_t(addr>>24);
+    }
+  }
+
+  void refreshCrcs() {
+    for (const auto &I : Instrs) {
+      uint8_t *inst = Code.data() + I.off;
+      uint16_t len = (uint16_t)inst[0] | ((uint16_t)inst[1] << 8);
+      if (len == 0)
+        continue;
+      uint16_t crc = crc16_ccitt(inst + kHdrBytes, len);
+      inst[2] = (uint8_t)(crc & 0xFF);
+      inst[3] = (uint8_t)((crc >> 8) & 0xFF);
+    }
+  }
+
+  void buildIpHashSet() {
+    IpHashSet.clear();
+    const llvm::BasicBlock *Entry = &F.getEntryBlock();
+    for (auto &BB : F) {
+      bool UseHash = false;
+      if (&BB != Entry)
+        UseHash = true;
+      if (UseHash) {
+        auto it = AddrOfBB.find(&BB);
+        if (it != AddrOfBB.end())
+          IpHashSet.insert(it->second);
+      }
+    }
+#ifdef SVM_CODEGEN_DEBUG
+    llvm::errs() << "[svm.codegen] hashset.size=" << IpHashSet.size() << "\n";
+    for (auto ip : IpHashSet) {
+      llvm::errs() << "[svm.codegen] hash.ip=0x" << llvm::format_hex(ip, 6) << "\n";
+    }
+#endif
+  }
+
+  void encryptInstructions(uint64_t seed) {
+    uint64_t key = seed;
+    for (const auto &I : Instrs) {
+      const uint8_t *plain = Code.data() + I.off;
+      uint16_t len = (uint16_t)plain[0] | ((uint16_t)plain[1] << 8);
+      uint8_t opcode = (I.len > kHdrBytes) ? plain[kHdrBytes] : 0;
+      uint64_t ip = I.off;
+      if (IpHashSet.count((uint32_t)ip)) {
+        key = hashSeedIp(seed, ip);
+      }
+#ifdef SVM_CODEGEN_DEBUG
+      llvm::errs() << "[svm.codegen] ip=" << llvm::format_hex(ip, 6)
+                   << " len=" << len
+                   << " op=" << llvm::format_hex((unsigned)opcode, 4)
+                   << " key=" << llvm::format_hex(key, 18)
+                   << " mode=" << (IpHashSet.count((uint32_t)ip) ? "hash" : "chain")
+                   << "\n";
+#endif
+      uint64_t ks = key;
+      for (uint32_t i = 0; i < I.len; ++i) {
+        Code[I.off + i] = plain[i] ^ nextStreamByte(ks);
+      }
+      key = mixKey(key, ip, opcode, len);
     }
   }
 };

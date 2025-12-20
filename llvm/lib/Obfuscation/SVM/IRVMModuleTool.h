@@ -68,10 +68,12 @@ public:
       vmp::PhiEliminateTool phiTool(/*simplifySelect01=*/true);
       (void)phiTool.run(F);
       auto st = phiTool.getStats();
+
+#ifdef SVM_IRVM_DEBUG
       llvm::errs() << "[x-svm] phi eliminated=" << st.NumPhiEliminated
                    << ", edges split=" << st.NumEdgesSplit
                    << ", select01=" << st.NumSelect01 << " @ " << F.getName() << "\n";
-
+#endif
       // switch -> if
       (void)switchTool.transform(F);
 
@@ -83,16 +85,20 @@ public:
         if (hasPhi || hasSwitch) break;
       }
       if (hasPhi || hasSwitch) {
+#ifdef SVM_IRVM_DEBUG
         llvm::errs() << "[x-svm] skip (post-simplify) " << F.getName()
                      << " : still has " << (hasPhi ? "PHI " : "")
                      << (hasSwitch ? "SWITCH " : "") << "\n";
+#endif
         S.NumSkippedPostSimplify++;
         continue;
       }
 
       std::string why2;
       if (!isVMFriendlyPostNormalize(F, *TheDL, why2)) {
+        #ifdef SVM_IRVM_DEBUG
         llvm::errs() << "[x-svm] skip (post) " << F.getName() << " : " << why2 << "\n";
+        #endif
         S.NumSkippedPostSimplify++;
         continue;
       }
@@ -109,7 +115,9 @@ public:
       {
         std::string why;
         if (!isVMFriendlyPostNormalize(F, *TheDL, why)) {
+          #ifdef SVM_IRVM_DEBUG
           llvm::errs() << "[x-svm] skip (codegen) " << F.getName() << " : " << why << "\n";
+          #endif
           S.NumSkippedCodegen++;
           continue;
         }
@@ -122,9 +130,10 @@ public:
       auto *ArrTy = llvm::ArrayType::get(llvm::Type::getInt8Ty(M.getContext()),
                                          bytes.size());
       std::string codeName = sanitizeName(F.getName()) + "_code";
+#ifdef SVM_IRVM_DEBUG
       llvm::errs() << "[x-svm] emit code global: " << codeName
                    << " (" << bytes.size() << " bytes)\n";
-
+#endif
       llvm::GlobalVariable *GV =
           ginit::ensureDefinableGV(M, codeName.c_str(), ArrTy, llvm::Align(1));
       GV->setLinkage(llvm::GlobalValue::ExternalLinkage);
@@ -137,14 +146,18 @@ public:
         S.NumSkippedCodegen++;
         continue;
       } else {
+        #ifdef SVM_IRVM_DEBUG
         llvm::errs() << "[x-svm]   + bytes initialized\n";
+        #endif
         S.NumEmitted++;
       }
 
       frx::VMExecOptions opt{};
       frx::rewriteToVMExec(F, GV, bytes.size(), opt);
+      #ifdef SVM_IRVM_DEBUG
       llvm::errs() << "[x-svm]   + rewritten to vm_exec stub: "
                    << F.getName() << "\n";
+      #endif
       S.NumRewritten++;
     }
 

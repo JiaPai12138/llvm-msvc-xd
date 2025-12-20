@@ -13,6 +13,9 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
+
+//#define SVM_INTERP_DEBUG 1
 
 namespace svm {
 
@@ -149,6 +152,13 @@ private:
     return Callee;
   }
 
+#ifdef SVM_INTERP_DEBUG
+  llvm::FunctionCallee getPrintf() {
+    auto *FT = llvm::FunctionType::get(I32Ty, {PtrTy}, true);
+    return M.getOrInsertFunction("printf", FT);
+  }
+#endif
+
   void generateBody(llvm::Function *F,
                     llvm::Argument *ArgCode,
                     llvm::Argument *ArgSize,
@@ -167,16 +177,31 @@ private:
     Value *DsCap = B.CreateAlloca(I32Ty, nullptr, "ds.cap");
     Value *RetVal = B.CreateAlloca(I64Ty, nullptr, "ret_val");
 
-    // Pointer variables
+    // Pointer / key variables
     Value *CodePtr = B.CreateAlloca(PtrTy, nullptr, "p");
     Value *EndPtr = B.CreateAlloca(PtrTy, nullptr, "end");
+    Value *InstrStart = B.CreateAlloca(PtrTy, nullptr, "instr.start");
+    Value *KeyVar = B.CreateAlloca(I64Ty, nullptr, "key");
+    Value *KeyStream = B.CreateAlloca(I64Ty, nullptr, "ks");
+    Value *NextKey = B.CreateAlloca(I64Ty, nullptr, "next.key");
+    Value *CurIp = B.CreateAlloca(I64Ty, nullptr, "cur.ip");
+#ifdef SVM_INTERP_DEBUG
+    Value *KeyMode = B.CreateAlloca(I8Ty, nullptr, "key.mode");
+#endif
 
     // Initialize
     B.CreateStore(ConstantPointerNull::get(cast<PointerType>(PtrTy)), DsBuf);
     B.CreateStore(ConstantInt::get(I32Ty, 0), DsSz);
     B.CreateStore(ConstantInt::get(I32Ty, 0), DsCap);
     B.CreateStore(ConstantInt::get(I64Ty, 0), RetVal);
-    B.CreateStore(ArgCode, CodePtr);
+
+    // Seed is stored at code[0..7]
+    Value *Seed = B.CreateLoad(I64Ty, ArgCode, "seed");
+    B.CreateStore(Seed, KeyVar);
+
+    // Start of encrypted stream = code + 8
+    Value *Start = B.CreateGEP(I8Ty, ArgCode, ConstantInt::get(I64Ty, 8), "code.start");
+    B.CreateStore(Start, CodePtr);
 
     // end = code + size
     Value *End = B.CreateGEP(I8Ty, ArgCode, B.CreateZExt(ArgSize, I64Ty), "end.calc");
@@ -196,36 +221,167 @@ private:
     Value *Cond = B.CreateICmpULT(P, E, "loop.cond");
     B.CreateCondBr(Cond, LoopBody, ExitBlock);
 
-    // Loop body: read opcode and dispatch
+    // Loop body: decrypt instruction header and dispatch
     B.SetInsertPoint(LoopBody);
 
-    // Read opcode
+    Value *CurKey = B.CreateLoad(I64Ty, KeyVar, "key.cur");
     P = B.CreateLoad(PtrTy, CodePtr, "p.cur");
-    Value *Opcode = B.CreateLoad(I8Ty, P, "opcode");
-    Value *PNext = B.CreateGEP(I8Ty, P, ConstantInt::get(I64Ty, 1));
-    B.CreateStore(PNext, CodePtr);
+    B.CreateStore(P, InstrStart);
+
+    Value *PInt = B.CreatePtrToInt(P, I64Ty);
+    Value *BaseInt = B.CreatePtrToInt(ArgCode, I64Ty);
+    Value *Ip = B.CreateSub(PInt, BaseInt, "ip");
+    B.CreateStore(Ip, CurIp);
+#ifdef SVM_INTERP_DEBUG
+    emitDebugFetch(B, Ip, CurKey);
+    emitDebugPtr(B, P, E);
+#endif
+
+    // Try with current key
+    Value *TmpPtr = B.CreateAlloca(PtrTy, nullptr, "tmp.p");
+    Value *TmpKey = B.CreateAlloca(I64Ty, nullptr, "tmp.key");
+    B.CreateStore(P, TmpPtr);
+    B.CreateStore(CurKey, TmpKey);
+    Value *Len1 = readEncU16(B, TmpPtr, EndPtr, TmpKey);
+    Value *Crc1 = readEncU16(B, TmpPtr, EndPtr, TmpKey);
+    Value *TmpPtr1 = B.CreateLoad(PtrTy, TmpPtr);
+    Value *Rem1 = B.CreateSub(B.CreatePtrToInt(EndPtr, I64Ty),
+                              B.CreatePtrToInt(TmpPtr1, I64Ty));
+    Value *Len1_64 = B.CreateZExt(Len1, I64Ty);
+    Value *LenOk1 = B.CreateICmpULE(Len1_64, Rem1);
+#ifdef SVM_INTERP_DEBUG
+    emitDebugHdr(B, Ip, Len1, Crc1, LenOk1);
+#endif
+    BasicBlock *Crc1BB = BasicBlock::Create(Ctx, "crc1.chk", F);
+    BasicBlock *Crc1BadBB = BasicBlock::Create(Ctx, "crc1.badlen", F);
+    BasicBlock *Crc1MergeBB = BasicBlock::Create(Ctx, "crc1.merge", F);
+    B.CreateCondBr(LenOk1, Crc1BB, Crc1BadBB);
+
+    B.SetInsertPoint(Crc1BB);
+    Value *Calc1 = computeCrcOverPayload(B, TmpPtr, EndPtr, TmpKey, Len1);
+    Value *CrcOk1 = B.CreateICmpEQ(Calc1, Crc1);
+    B.CreateBr(Crc1MergeBB);
+    BasicBlock *Crc1OkEnd = B.GetInsertBlock();
+
+    B.SetInsertPoint(Crc1BadBB);
+    B.CreateBr(Crc1MergeBB);
+    BasicBlock *Crc1BadEnd = B.GetInsertBlock();
+
+    B.SetInsertPoint(Crc1MergeBB);
+    PHINode *Ok1 = B.CreatePHI(I1Ty, 2, "crc1.ok");
+    Ok1->addIncoming(CrcOk1, Crc1OkEnd);
+    Ok1->addIncoming(ConstantInt::getFalse(Ctx), Crc1BadEnd);
+
+    // If CRC fails, retry with hash(seed, ip)
+    Value *HashKeyVar = B.CreateAlloca(I64Ty, nullptr, "key.hash");
+    BasicBlock *UseCurBB = BasicBlock::Create(Ctx, "key.use.cur", F);
+    BasicBlock *TryHashBB = BasicBlock::Create(Ctx, "key.try.hash", F);
+    BasicBlock *UseHashBB = BasicBlock::Create(Ctx, "key.use.hash", F);
+    BasicBlock *BadKeyBB = BasicBlock::Create(Ctx, "key.bad", F);
+    BasicBlock *DecodeBB = BasicBlock::Create(Ctx, "decode", F);
+    B.CreateCondBr(Ok1, UseCurBB, TryHashBB);
+
+    B.SetInsertPoint(UseCurBB);
+    B.CreateStore(CurKey, KeyVar);
+#ifdef SVM_INTERP_DEBUG
+    B.CreateStore(ConstantInt::get(I8Ty, 0), KeyMode);
+#endif
+    B.CreateBr(DecodeBB);
+
+    B.SetInsertPoint(TryHashBB);
+#ifdef SVM_INTERP_DEBUG
+    emitDebugCrcFail(B, Ip, Len1, Crc1, LenOk1);
+#endif
+    Value *HashKey = hashSeedIp(B, Seed, Ip);
+    B.CreateStore(HashKey, HashKeyVar);
+    B.CreateStore(P, TmpPtr);
+    B.CreateStore(HashKey, TmpKey);
+    Value *Len2 = readEncU16(B, TmpPtr, EndPtr, TmpKey);
+    Value *Crc2 = readEncU16(B, TmpPtr, EndPtr, TmpKey);
+    Value *TmpPtr2 = B.CreateLoad(PtrTy, TmpPtr);
+    Value *Rem2 = B.CreateSub(B.CreatePtrToInt(EndPtr, I64Ty),
+                              B.CreatePtrToInt(TmpPtr2, I64Ty));
+    Value *Len2_64 = B.CreateZExt(Len2, I64Ty);
+    Value *LenOk2 = B.CreateICmpULE(Len2_64, Rem2);
+    BasicBlock *Crc2BB = BasicBlock::Create(Ctx, "crc2.chk", F);
+    BasicBlock *Crc2BadBB = BasicBlock::Create(Ctx, "crc2.badlen", F);
+    BasicBlock *Crc2MergeBB = BasicBlock::Create(Ctx, "crc2.merge", F);
+    B.CreateCondBr(LenOk2, Crc2BB, Crc2BadBB);
+
+    B.SetInsertPoint(Crc2BB);
+    Value *Calc2 = computeCrcOverPayload(B, TmpPtr, EndPtr, TmpKey, Len2);
+    Value *CrcOk2 = B.CreateICmpEQ(Calc2, Crc2);
+    B.CreateBr(Crc2MergeBB);
+    BasicBlock *Crc2OkEnd = B.GetInsertBlock();
+
+    B.SetInsertPoint(Crc2BadBB);
+    B.CreateBr(Crc2MergeBB);
+    BasicBlock *Crc2BadEnd = B.GetInsertBlock();
+
+    B.SetInsertPoint(Crc2MergeBB);
+    PHINode *Ok2 = B.CreatePHI(I1Ty, 2, "crc2.ok");
+    Ok2->addIncoming(CrcOk2, Crc2OkEnd);
+    Ok2->addIncoming(ConstantInt::getFalse(Ctx), Crc2BadEnd);
+    B.CreateCondBr(Ok2, UseHashBB, BadKeyBB);
+
+    B.SetInsertPoint(UseHashBB);
+    Value *HashKey2 = B.CreateLoad(I64Ty, HashKeyVar);
+    B.CreateStore(HashKey2, KeyVar);
+#ifdef SVM_INTERP_DEBUG
+    B.CreateStore(ConstantInt::get(I8Ty, 1), KeyMode);
+#endif
+    B.CreateBr(DecodeBB);
+
+    B.SetInsertPoint(BadKeyBB);
+#ifdef SVM_INTERP_DEBUG
+    emitDebugBadKey(B, Ip);
+#endif
+    B.CreateBr(ExitBlock);
+
+    // Decode with chosen key
+    B.SetInsertPoint(DecodeBB);
+    Value *ChosenKey = B.CreateLoad(I64Ty, KeyVar);
+    Value *StartP = B.CreateLoad(PtrTy, InstrStart);
+    B.CreateStore(StartP, CodePtr);
+    B.CreateStore(ChosenKey, KeyStream);
+
+    Value *Len = readEncU16(B, CodePtr, EndPtr, KeyStream);
+    (void)readEncU16(B, CodePtr, EndPtr, KeyStream); // crc16
+    Value *Opcode = readEncU8(B, CodePtr, EndPtr, KeyStream);
+    Value *Next = mixKey(B, ChosenKey, Ip, Opcode, Len);
+    B.CreateStore(Next, NextKey);
+#ifdef SVM_INTERP_DEBUG
+    emitDebugDecode(B, Ip, Len, Opcode, ChosenKey, KeyMode);
+#endif
 
     // Create switch for opcodes
     BasicBlock *DefaultBB = BasicBlock::Create(Ctx, "op.default", F);
     SwitchInst *Sw = B.CreateSwitch(Opcode, DefaultBB, 14);
 
     // Generate handlers for each opcode
-    generateOpParamMap(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, ArgArgs, ArgNum, LoopHeader);
-    generateOpAlloca(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, LoopHeader);
-    generateOpLoad(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, LoopHeader);
-    generateOpStore(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, LoopHeader);
-    generateOpGep(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, LoopHeader);
-    generateOpCmp(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, LoopHeader);
-    generateOpCast(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, LoopHeader);
-    generateOpBr(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, ArgCode, LoopHeader, ExitBlock);
-    generateOpArith(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, LoopHeader);
-    generateOpCall(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, LoopHeader);
-    generateOpRet(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, RetVal, ExitBlock);
-    generateOpSelect(F, Sw, CodePtr, EndPtr, DsBuf, DsSz, DsCap, LoopHeader);
+    BasicBlock *LoopNext = BasicBlock::Create(Ctx, "loop.next", F);
+    generateOpParamMap(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, ArgArgs, ArgNum, LoopNext);
+    generateOpAlloca(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, CurIp, LoopNext);
+    generateOpLoad(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, CurIp, LoopNext);
+    generateOpStore(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, CurIp, LoopNext);
+    generateOpGep(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, LoopNext);
+    generateOpCmp(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, LoopNext);
+    generateOpCast(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, LoopNext);
+    generateOpBr(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap,
+                 ArgCode, CurIp, Seed, NextKey, LoopNext);
+    generateOpArith(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, LoopNext);
+    generateOpCall(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, LoopNext);
+    generateOpRet(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, RetVal, ExitBlock);
+    generateOpSelect(F, Sw, CodePtr, EndPtr, KeyStream, DsBuf, DsSz, DsCap, LoopNext);
 
     // Default: go to exit
     IRBuilder<> BD(DefaultBB);
     BD.CreateBr(ExitBlock);
+
+    B.SetInsertPoint(LoopNext);
+    Value *NK = B.CreateLoad(I64Ty, NextKey);
+    B.CreateStore(NK, KeyVar);
+    B.CreateBr(LoopHeader);
 
     // Exit block: cleanup and return
     B.SetInsertPoint(ExitBlock);
@@ -235,51 +391,265 @@ private:
     B.CreateRet(Ret);
   }
 
-  // Helper: read u8 from bytecode
-  llvm::Value* readU8(llvm::IRBuilder<> &B, llvm::Value *CodePtr, llvm::Value *EndPtr) {
+  // xxhash-like mix / stream helpers
+  llvm::Value* rotl64(llvm::IRBuilder<> &B, llvm::Value *V, unsigned r) {
+    using namespace llvm;
+    Value *Shl = B.CreateShl(V, r);
+    Value *Shr = B.CreateLShr(V, 64 - r);
+    return B.CreateOr(Shl, Shr);
+  }
+
+  llvm::Value* mixKey(llvm::IRBuilder<> &B, llvm::Value *Prev,
+                      llvm::Value *Ip, llvm::Value *Opcode, llvm::Value *Len) {
+    using namespace llvm;
+    Value *P1 = ConstantInt::get(I64Ty, 11400714785074694791ULL);
+    Value *P2 = ConstantInt::get(I64Ty, 14029467366897019727ULL);
+    Value *P3 = ConstantInt::get(I64Ty, 1609587929392839161ULL);
+    Value *P4 = ConstantInt::get(I64Ty, 9650029242287828579ULL);
+
+    Value *K = B.CreateAdd(Prev, P1);
+    Value *Ip64 = B.CreateZExtOrTrunc(Ip, I64Ty);
+    Value *Op64 = B.CreateZExt(Opcode, I64Ty);
+    Value *Len64 = B.CreateZExt(Len, I64Ty);
+    K = B.CreateXor(K, B.CreateMul(Ip64, P2));
+    K = B.CreateXor(K, B.CreateMul(Op64, P3));
+    K = B.CreateXor(K, B.CreateMul(Len64, P4));
+    K = B.CreateMul(rotl64(B, K, 31), P1);
+
+    K = B.CreateXor(K, B.CreateLShr(K, 33));
+    K = B.CreateMul(K, P2);
+    K = B.CreateXor(K, B.CreateLShr(K, 29));
+    K = B.CreateMul(K, P3);
+    K = B.CreateXor(K, B.CreateLShr(K, 32));
+    return K;
+  }
+
+  llvm::Value* hashSeedIp(llvm::IRBuilder<> &B, llvm::Value *Seed, llvm::Value *Ip) {
+    using namespace llvm;
+    Value *P1 = ConstantInt::get(I64Ty, 11400714785074694791ULL);
+    Value *P2 = ConstantInt::get(I64Ty, 14029467366897019727ULL);
+    Value *P3 = ConstantInt::get(I64Ty, 1609587929392839161ULL);
+
+    Value *K = B.CreateAdd(Seed, P1);
+    Value *Ip64 = B.CreateZExtOrTrunc(Ip, I64Ty);
+    K = B.CreateXor(K, B.CreateMul(Ip64, P2));
+    K = B.CreateMul(rotl64(B, K, 31), P1);
+    K = B.CreateXor(K, B.CreateLShr(K, 33));
+    K = B.CreateMul(K, P2);
+    K = B.CreateXor(K, B.CreateLShr(K, 29));
+    K = B.CreateMul(K, P3);
+    K = B.CreateXor(K, B.CreateLShr(K, 32));
+    return K;
+  }
+
+  llvm::Value* nextStreamByte(llvm::IRBuilder<> &B, llvm::Value *KeyState) {
+    using namespace llvm;
+    Value *P1 = ConstantInt::get(I64Ty, 11400714785074694791ULL);
+    Value *P5 = ConstantInt::get(I64Ty, 2870177450012600261ULL);
+    Value *K = B.CreateLoad(I64Ty, KeyState);
+    K = B.CreateAdd(K, P5);
+    K = B.CreateMul(rotl64(B, K, 17), P1);
+    B.CreateStore(K, KeyState);
+    return B.CreateTrunc(K, I8Ty);
+  }
+
+  // Helper: read encrypted u8 from bytecode
+  llvm::Value* readEncU8(llvm::IRBuilder<> &B, llvm::Value *CodePtr,
+                         llvm::Value *EndPtr, llvm::Value *KeyState) {
     using namespace llvm;
     Value *P = B.CreateLoad(PtrTy, CodePtr);
-    Value *V = B.CreateLoad(I8Ty, P);
+    Value *Enc = B.CreateLoad(I8Ty, P);
+    Value *Ks = nextStreamByte(B, KeyState);
+    Value *Dec = B.CreateXor(Enc, Ks);
     Value *PNext = B.CreateGEP(I8Ty, P, ConstantInt::get(I64Ty, 1));
     B.CreateStore(PNext, CodePtr);
+    return Dec;
+  }
+
+  llvm::Value* readEncU16(llvm::IRBuilder<> &B, llvm::Value *CodePtr,
+                          llvm::Value *EndPtr, llvm::Value *KeyState) {
+    using namespace llvm;
+    Value *B0 = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *B1 = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *V = B.CreateZExt(B0, I32Ty);
+    V = B.CreateOr(V, B.CreateShl(B.CreateZExt(B1, I32Ty), 8));
     return V;
   }
 
-  // Helper: read u32 from bytecode (little endian)
-  llvm::Value* readU32(llvm::IRBuilder<> &B, llvm::Value *CodePtr, llvm::Value *EndPtr) {
+  // Helper: read encrypted u32 from bytecode (little endian)
+  llvm::Value* readEncU32(llvm::IRBuilder<> &B, llvm::Value *CodePtr,
+                          llvm::Value *EndPtr, llvm::Value *KeyState) {
     using namespace llvm;
-    Value *P = B.CreateLoad(PtrTy, CodePtr);
-    // Read 4 bytes and combine (little endian)
-    Value *B0 = B.CreateLoad(I8Ty, P);
-    Value *B1 = B.CreateLoad(I8Ty, B.CreateGEP(I8Ty, P, ConstantInt::get(I64Ty, 1)));
-    Value *B2 = B.CreateLoad(I8Ty, B.CreateGEP(I8Ty, P, ConstantInt::get(I64Ty, 2)));
-    Value *B3 = B.CreateLoad(I8Ty, B.CreateGEP(I8Ty, P, ConstantInt::get(I64Ty, 3)));
-
+    Value *B0 = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *B1 = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *B2 = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *B3 = readEncU8(B, CodePtr, EndPtr, KeyState);
     Value *V = B.CreateZExt(B0, I32Ty);
     V = B.CreateOr(V, B.CreateShl(B.CreateZExt(B1, I32Ty), 8));
     V = B.CreateOr(V, B.CreateShl(B.CreateZExt(B2, I32Ty), 16));
     V = B.CreateOr(V, B.CreateShl(B.CreateZExt(B3, I32Ty), 24));
-
-    Value *PNext = B.CreateGEP(I8Ty, P, ConstantInt::get(I64Ty, 4));
-    B.CreateStore(PNext, CodePtr);
     return V;
   }
 
-  // Helper: read u64 from bytecode (little endian)
-  llvm::Value* readU64(llvm::IRBuilder<> &B, llvm::Value *CodePtr, llvm::Value *EndPtr) {
+  // Helper: read encrypted u64 from bytecode (little endian)
+  llvm::Value* readEncU64(llvm::IRBuilder<> &B, llvm::Value *CodePtr,
+                          llvm::Value *EndPtr, llvm::Value *KeyState) {
     using namespace llvm;
-    Value *P = B.CreateLoad(PtrTy, CodePtr);
-    // Read 8 bytes
     Value *V = ConstantInt::get(I64Ty, 0);
     for (int i = 0; i < 8; i++) {
-      Value *Bi = B.CreateLoad(I8Ty, B.CreateGEP(I8Ty, P, ConstantInt::get(I64Ty, i)));
+      Value *Bi = readEncU8(B, CodePtr, EndPtr, KeyState);
       Value *Shifted = B.CreateShl(B.CreateZExt(Bi, I64Ty), i * 8);
       V = B.CreateOr(V, Shifted);
     }
-    Value *PNext = B.CreateGEP(I8Ty, P, ConstantInt::get(I64Ty, 8));
-    B.CreateStore(PNext, CodePtr);
     return V;
   }
+
+  llvm::Value* crc16Update(llvm::IRBuilder<> &B, llvm::Value *Crc, llvm::Value *Byte) {
+    using namespace llvm;
+    Value *C = B.CreateXor(Crc, B.CreateShl(B.CreateZExt(Byte, I32Ty), 8));
+    for (int i = 0; i < 8; ++i) {
+      Value *Msb = B.CreateAnd(C, ConstantInt::get(I32Ty, 0x8000));
+      Value *Shift = B.CreateShl(C, 1);
+      Value *XorVal = B.CreateXor(Shift, ConstantInt::get(I32Ty, 0x1021));
+      Value *UseXor = B.CreateICmpNE(Msb, ConstantInt::get(I32Ty, 0));
+      C = B.CreateSelect(UseXor, XorVal, Shift);
+    }
+    return B.CreateAnd(C, ConstantInt::get(I32Ty, 0xFFFF));
+  }
+
+  llvm::Value* computeCrcOverPayload(llvm::IRBuilder<> &B, llvm::Value *TmpPtr,
+                                     llvm::Value *EndPtr, llvm::Value *KeyState,
+                                     llvm::Value *Len) {
+    using namespace llvm;
+    Function *F = B.GetInsertBlock()->getParent();
+    Value *CrcVar = B.CreateAlloca(I32Ty, nullptr, "crc");
+    B.CreateStore(ConstantInt::get(I32Ty, 0xFFFF), CrcVar);
+
+    Value *Idx = B.CreateAlloca(I32Ty, nullptr, "crc.i");
+    B.CreateStore(ConstantInt::get(I32Ty, 0), Idx);
+
+    BasicBlock *LoopHdr = BasicBlock::Create(Ctx, "crc.hdr", F);
+    BasicBlock *LoopBody = BasicBlock::Create(Ctx, "crc.body", F);
+    BasicBlock *LoopEnd = BasicBlock::Create(Ctx, "crc.end", F);
+    B.CreateBr(LoopHdr);
+
+    B.SetInsertPoint(LoopHdr);
+    Value *I = B.CreateLoad(I32Ty, Idx);
+    Value *Cond = B.CreateICmpULT(I, Len);
+    B.CreateCondBr(Cond, LoopBody, LoopEnd);
+
+    B.SetInsertPoint(LoopBody);
+    Value *Byte = readEncU8(B, TmpPtr, EndPtr, KeyState);
+    Value *Crc = B.CreateLoad(I32Ty, CrcVar);
+    Value *CrcNext = crc16Update(B, Crc, Byte);
+    B.CreateStore(CrcNext, CrcVar);
+    Value *IInc = B.CreateAdd(I, ConstantInt::get(I32Ty, 1));
+    B.CreateStore(IInc, Idx);
+    B.CreateBr(LoopHdr);
+
+    B.SetInsertPoint(LoopEnd);
+    return B.CreateLoad(I32Ty, CrcVar);
+  }
+
+#ifdef SVM_INTERP_DEBUG
+  void emitDebugDecode(llvm::IRBuilder<> &B, llvm::Value *Ip, llvm::Value *Len,
+                       llvm::Value *Opcode, llvm::Value *Key,
+                       llvm::Value *KeyMode) {
+    using namespace llvm;
+    Value *Ip64 = B.CreateZExtOrTrunc(Ip, I64Ty);
+    Value *Len32 = B.CreateZExtOrTrunc(Len, I32Ty);
+    Value *Op32 = B.CreateZExt(Opcode, I32Ty);
+    Value *Mode32 = B.CreateZExt(B.CreateLoad(I8Ty, KeyMode), I32Ty);
+    Value *Fmt = B.CreateGlobalStringPtr(
+        "[svm.exec] ip=0x%llx len=%u op=0x%02x key=0x%llx mode=%u\n");
+    B.CreateCall(getPrintf(), {Fmt, Ip64, Len32, Op32, Key, Mode32});
+  }
+
+  void emitDebugBadKey(llvm::IRBuilder<> &B, llvm::Value *Ip) {
+    using namespace llvm;
+    Value *Ip64 = B.CreateZExtOrTrunc(Ip, I64Ty);
+    Value *Fmt = B.CreateGlobalStringPtr("[svm.exec] badkey ip=0x%llx\n");
+    B.CreateCall(getPrintf(), {Fmt, Ip64});
+  }
+
+  void emitDebugFetch(llvm::IRBuilder<> &B, llvm::Value *Ip, llvm::Value *Key) {
+    using namespace llvm;
+    Value *Ip64 = B.CreateZExtOrTrunc(Ip, I64Ty);
+    Value *Fmt = B.CreateGlobalStringPtr(
+        "[svm.exec] fetch ip=0x%llx key=0x%llx\n");
+    B.CreateCall(getPrintf(), {Fmt, Ip64, Key});
+  }
+
+  void emitDebugPtr(llvm::IRBuilder<> &B, llvm::Value *P, llvm::Value *End) {
+    using namespace llvm;
+    Value *P64 = B.CreatePtrToInt(P, I64Ty);
+    Value *E64 = B.CreatePtrToInt(End, I64Ty);
+    Value *Fmt = B.CreateGlobalStringPtr(
+        "[svm.exec] ptr p=0x%llx end=0x%llx\n");
+    B.CreateCall(getPrintf(), {Fmt, P64, E64});
+  }
+
+  void emitDebugHdr(llvm::IRBuilder<> &B, llvm::Value *Ip,
+                    llvm::Value *Len, llvm::Value *Crc,
+                    llvm::Value *LenOk) {
+    using namespace llvm;
+    Value *Ip64 = B.CreateZExtOrTrunc(Ip, I64Ty);
+    Value *Len32 = B.CreateZExtOrTrunc(Len, I32Ty);
+    Value *Crc32 = B.CreateZExtOrTrunc(Crc, I32Ty);
+    Value *LenOk32 = B.CreateZExtOrTrunc(LenOk, I32Ty);
+    Value *Fmt = B.CreateGlobalStringPtr(
+        "[svm.exec] hdr ip=0x%llx len=%u crc=0x%04x lenok=%u\n");
+    B.CreateCall(getPrintf(), {Fmt, Ip64, Len32, Crc32, LenOk32});
+  }
+
+  void emitDebugCrcFail(llvm::IRBuilder<> &B, llvm::Value *Ip,
+                        llvm::Value *Len, llvm::Value *Crc,
+                        llvm::Value *LenOk) {
+    using namespace llvm;
+    Value *Ip64 = B.CreateZExtOrTrunc(Ip, I64Ty);
+    Value *Len32 = B.CreateZExtOrTrunc(Len, I32Ty);
+    Value *Crc32 = B.CreateZExtOrTrunc(Crc, I32Ty);
+    Value *LenOk32 = B.CreateZExtOrTrunc(LenOk, I32Ty);
+    Value *Fmt = B.CreateGlobalStringPtr(
+        "[svm.exec] crc1.fail ip=0x%llx len=%u crc=0x%04x lenok=%u\n");
+    B.CreateCall(getPrintf(), {Fmt, Ip64, Len32, Crc32, LenOk32});
+  }
+
+  void emitDebugStore(llvm::IRBuilder<> &B, llvm::Value *Ip,
+                      llvm::Value *Ptr, llvm::Value *Val,
+                      llvm::Value *IsSlot) {
+    using namespace llvm;
+    Value *Ip64 = B.CreateZExtOrTrunc(Ip, I64Ty);
+    Value *Ptr64 = B.CreateZExtOrTrunc(Ptr, I64Ty);
+    Value *Val64 = B.CreateZExtOrTrunc(Val, I64Ty);
+    Value *IsSlot32 = B.CreateZExt(IsSlot, I32Ty);
+    Value *Fmt = B.CreateGlobalStringPtr(
+        "[svm.exec] store ip=0x%llx ptr=0x%llx val=0x%llx slot=%u\n");
+    B.CreateCall(getPrintf(), {Fmt, Ip64, Ptr64, Val64, IsSlot32});
+  }
+
+  void emitDebugBr(llvm::IRBuilder<> &B, llvm::Value *Ip, llvm::Value *TargetOff) {
+    using namespace llvm;
+    Value *Ip64 = B.CreateZExtOrTrunc(Ip, I64Ty);
+    Value *T32 = B.CreateZExtOrTrunc(TargetOff, I32Ty);
+    Value *Fmt = B.CreateGlobalStringPtr(
+        "[svm.exec] br ip=0x%llx target=0x%08x\n");
+    B.CreateCall(getPrintf(), {Fmt, Ip64, T32});
+  }
+
+  void emitDebugAlloca(llvm::IRBuilder<> &B, llvm::Value *Ip,
+                       llvm::Value *Dst, llvm::Value *Area,
+                       llvm::Value *PtrVal) {
+    using namespace llvm;
+    Value *Ip64 = B.CreateZExtOrTrunc(Ip, I64Ty);
+    Value *Dst32 = B.CreateZExtOrTrunc(Dst, I32Ty);
+    Value *Area32 = B.CreateZExtOrTrunc(Area, I32Ty);
+    Value *Ptr64 = B.CreateZExtOrTrunc(PtrVal, I64Ty);
+    Value *Fmt = B.CreateGlobalStringPtr(
+        "[svm.exec] alloca ip=0x%llx dst=%u area=%u ptr=0x%llx\n");
+    B.CreateCall(getPrintf(), {Fmt, Ip64, Dst32, Area32, Ptr64});
+  }
+#endif
 
   // Helper: ensure data segment capacity
   void ensureData(llvm::IRBuilder<> &B, llvm::Value *DsBuf, llvm::Value *DsSz,
@@ -360,11 +730,12 @@ private:
   };
 
   EncodedValue readValue(llvm::IRBuilder<> &B, llvm::Value *CodePtr, llvm::Value *EndPtr,
+                         llvm::Value *KeyState,
                          llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap) {
     using namespace llvm;
     EncodedValue EV;
 
-    Value *Tag = readU8(B, CodePtr, EndPtr);
+    Value *Tag = readEncU8(B, CodePtr, EndPtr, KeyState);
     Value *IsSlot = B.CreateICmpEQ(Tag, ConstantInt::get(I8Ty, VT_SLOT));
 
     Function *F = B.GetInsertBlock()->getParent();
@@ -376,17 +747,17 @@ private:
 
     // Slot path
     B.SetInsertPoint(SlotBB);
-    Value *SlotOff = readU32(B, CodePtr, EndPtr);
+    Value *SlotOff = readEncU32(B, CodePtr, EndPtr, KeyState);
     Value *SlotVal = dsLoadU64(B, DsBuf, DsSz, DsCap, SlotOff);
     B.CreateBr(MergeBB);
     BasicBlock *SlotBBEnd = B.GetInsertBlock();
 
     // Const path
     B.SetInsertPoint(ConstBB);
-    Value *Ck = readU8(B, CodePtr, EndPtr);
-    Value *Sz = readU32(B, CodePtr, EndPtr);
+    Value *Ck = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *Sz = readEncU32(B, CodePtr, EndPtr, KeyState);
     // For simplicity, always read 8 bytes (handles most cases)
-    Value *ConstVal = readU64(B, CodePtr, EndPtr);
+    Value *ConstVal = readEncU64(B, CodePtr, EndPtr, KeyState);
     B.CreateBr(MergeBB);
     BasicBlock *ConstBBEnd = B.GetInsertBlock();
 
@@ -414,16 +785,17 @@ private:
   // OP_PARAMMAP handler
   void generateOpParamMap(llvm::Function *F, llvm::SwitchInst *Sw,
                           llvm::Value *CodePtr, llvm::Value *EndPtr,
+                          llvm::Value *KeyState,
                           llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
                           llvm::Value *ArgArgs, llvm::Value *ArgNum,
-                          llvm::BasicBlock *LoopHeader) {
+                          llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.parammap", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_PARAMMAP)), BB);
 
     IRBuilder<> B(BB);
-    Value *N = readU32(B, CodePtr, EndPtr);
+    Value *N = readEncU32(B, CodePtr, EndPtr, KeyState);
 
     // Loop: for i = 0 to N
     BasicBlock *LoopHdr = BasicBlock::Create(Ctx, "pm.loop.hdr", F);
@@ -440,8 +812,8 @@ private:
     B.CreateCondBr(Cond, LoopBody, LoopEnd);
 
     B.SetInsertPoint(LoopBody);
-    Value *Off = readU32(B, CodePtr, EndPtr);
-    Value *Sz = readU32(B, CodePtr, EndPtr);
+    Value *Off = readEncU32(B, CodePtr, EndPtr, KeyState);
+    Value *Sz = readEncU32(B, CodePtr, EndPtr, KeyState);
 
     // Ensure data segment has space
     Value *OffPlusSz = B.CreateAdd(Off, Sz);
@@ -487,22 +859,24 @@ private:
 
     // End
     B.SetInsertPoint(LoopEnd);
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 
   // OP_ALLOCA handler
   void generateOpAlloca(llvm::Function *F, llvm::SwitchInst *Sw,
                         llvm::Value *CodePtr, llvm::Value *EndPtr,
+                        llvm::Value *KeyState,
                         llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
-                        llvm::BasicBlock *LoopHeader) {
+                        llvm::Value *CurIp,
+                        llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.alloca", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_ALLOCA)), BB);
 
     IRBuilder<> B(BB);
-    Value *Dst = readU32(B, CodePtr, EndPtr);
-    Value *Area = readU32(B, CodePtr, EndPtr);
+    Value *Dst = readEncU32(B, CodePtr, EndPtr, KeyState);
+    Value *Area = readEncU32(B, CodePtr, EndPtr, KeyState);
 
     // malloc(area)
     Value *Mem = B.CreateCall(getMalloc(), {B.CreateZExt(Area, I64Ty)});
@@ -510,66 +884,77 @@ private:
 
     // Store to data segment
     dsStoreU64(B, DsBuf, DsSz, DsCap, Dst, MemI64);
+#ifdef SVM_INTERP_DEBUG
+    emitDebugAlloca(B, B.CreateLoad(I64Ty, CurIp), Dst, Area, MemI64);
+#endif
 
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 
   // OP_LOAD handler
   void generateOpLoad(llvm::Function *F, llvm::SwitchInst *Sw,
                       llvm::Value *CodePtr, llvm::Value *EndPtr,
+                      llvm::Value *KeyState,
                       llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
-                      llvm::BasicBlock *LoopHeader) {
+                      llvm::Value *CurIp,
+                      llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.load", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_LOAD)), BB);
 
     IRBuilder<> B(BB);
-    Value *Dst = readU32(B, CodePtr, EndPtr);
-    EncodedValue PtrVal = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
+    Value *Dst = readEncU32(B, CodePtr, EndPtr, KeyState);
+    EncodedValue PtrVal = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
 
     // Load 8 bytes from address
     Value *Addr = B.CreateIntToPtr(PtrVal.ValueU64, PtrTy);
     Value *Val = B.CreateLoad(I64Ty, Addr);
 
     dsStoreU64(B, DsBuf, DsSz, DsCap, Dst, Val);
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 
   // OP_STORE handler
   void generateOpStore(llvm::Function *F, llvm::SwitchInst *Sw,
                        llvm::Value *CodePtr, llvm::Value *EndPtr,
+                       llvm::Value *KeyState,
                        llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
-                       llvm::BasicBlock *LoopHeader) {
+                       llvm::Value *CurIp,
+                       llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.store", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_STORE)), BB);
 
     IRBuilder<> B(BB);
-    EncodedValue Val = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
-    EncodedValue PtrVal = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
+    EncodedValue Val = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
+    EncodedValue PtrVal = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
 
+#ifdef SVM_INTERP_DEBUG
+    emitDebugStore(B, B.CreateLoad(I64Ty, CurIp), PtrVal.ValueU64, Val.ValueU64, PtrVal.IsSlot);
+#endif
     Value *Addr = B.CreateIntToPtr(PtrVal.ValueU64, PtrTy);
     B.CreateStore(Val.ValueU64, Addr);
 
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 
   // OP_GEP handler
   void generateOpGep(llvm::Function *F, llvm::SwitchInst *Sw,
                      llvm::Value *CodePtr, llvm::Value *EndPtr,
+                     llvm::Value *KeyState,
                      llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
-                     llvm::BasicBlock *LoopHeader) {
+                     llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.gep", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_GEP)), BB);
 
     IRBuilder<> B(BB);
-    Value *Dst = readU32(B, CodePtr, EndPtr);
-    EncodedValue Base = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
-    Value *NIdx = readU32(B, CodePtr, EndPtr);
+    Value *Dst = readEncU32(B, CodePtr, EndPtr, KeyState);
+    EncodedValue Base = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
+    Value *NIdx = readEncU32(B, CodePtr, EndPtr, KeyState);
 
     // Loop to accumulate offsets
     Value *Off = B.CreateAlloca(I64Ty);
@@ -589,7 +974,7 @@ private:
     B.CreateCondBr(Cond, LoopBody, LoopEnd);
 
     B.SetInsertPoint(LoopBody);
-    EncodedValue IdxVal = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
+    EncodedValue IdxVal = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
     Value *CurOff = B.CreateLoad(I64Ty, Off);
     Value *NewOff = B.CreateAdd(CurOff, IdxVal.ValueU64);
     B.CreateStore(NewOff, Off);
@@ -602,24 +987,25 @@ private:
     Value *FinalOff = B.CreateLoad(I64Ty, Off);
     Value *Result = B.CreateAdd(Base.ValueU64, FinalOff);
     dsStoreU64(B, DsBuf, DsSz, DsCap, Dst, Result);
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 
   // OP_CMP handler
   void generateOpCmp(llvm::Function *F, llvm::SwitchInst *Sw,
                      llvm::Value *CodePtr, llvm::Value *EndPtr,
+                     llvm::Value *KeyState,
                      llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
-                     llvm::BasicBlock *LoopHeader) {
+                     llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.cmp", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_CMP)), BB);
 
     IRBuilder<> B(BB);
-    Value *Pred = readU8(B, CodePtr, EndPtr);
-    Value *Dst = readU32(B, CodePtr, EndPtr);
-    EncodedValue L = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
-    EncodedValue R = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
+    Value *Pred = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *Dst = readEncU32(B, CodePtr, EndPtr, KeyState);
+    EncodedValue L = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
+    EncodedValue R = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
 
     // Simplified: treat as ICmp for now
     Value *IsFCmp = B.CreateICmpULT(Pred, ConstantInt::get(I8Ty, 32));
@@ -690,45 +1076,48 @@ private:
     ResPhi->addIncoming(ICmpI64, ICmpEnd);
 
     dsStoreU64(B, DsBuf, DsSz, DsCap, Dst, ResPhi);
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 
   // OP_CAST handler
   void generateOpCast(llvm::Function *F, llvm::SwitchInst *Sw,
                       llvm::Value *CodePtr, llvm::Value *EndPtr,
+                      llvm::Value *KeyState,
                       llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
-                      llvm::BasicBlock *LoopHeader) {
+                      llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.cast", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_CAST)), BB);
 
     IRBuilder<> B(BB);
-    Value *Cop = readU8(B, CodePtr, EndPtr);
-    Value *Dst = readU32(B, CodePtr, EndPtr);
-    EncodedValue V = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
+    Value *Cop = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *Dst = readEncU32(B, CodePtr, EndPtr, KeyState);
+    EncodedValue V = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
 
     // For most casts, just pass through or do simple transform
     // This is simplified - full implementation would handle all cast types
     Value *Result = V.ValueU64;  // Default: pass through
 
     dsStoreU64(B, DsBuf, DsSz, DsCap, Dst, Result);
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 
   // OP_BR handler
   void generateOpBr(llvm::Function *F, llvm::SwitchInst *Sw,
                     llvm::Value *CodePtr, llvm::Value *EndPtr,
+                    llvm::Value *KeyState,
                     llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
-                    llvm::Value *ArgCode,
-                    llvm::BasicBlock *LoopHeader, llvm::BasicBlock *ExitBlock) {
+                    llvm::Value *ArgCode, llvm::Value *CurIp,
+                    llvm::Value *Seed, llvm::Value *NextKey,
+                    llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.br", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_BR)), BB);
 
     IRBuilder<> B(BB);
-    Value *IsCond = readU8(B, CodePtr, EndPtr);
+    Value *IsCond = readEncU8(B, CodePtr, EndPtr, KeyState);
     Value *IsCondBr = B.CreateICmpNE(IsCond, ConstantInt::get(I8Ty, 0));
 
     BasicBlock *UncondBB = BasicBlock::Create(Ctx, "br.uncond", F);
@@ -738,41 +1127,54 @@ private:
 
     // Unconditional branch
     B.SetInsertPoint(UncondBB);
-    Value *Target = readU32(B, CodePtr, EndPtr);
+    Value *Target = readEncU32(B, CodePtr, EndPtr, KeyState);
+#ifdef SVM_INTERP_DEBUG
+    emitDebugBr(B, B.CreateLoad(I64Ty, CurIp), Target);
+#endif
+    Value *Target64 = B.CreateZExt(Target, I64Ty);
+    Value *NewKey = hashSeedIp(B, Seed, Target64);
+    B.CreateStore(NewKey, NextKey);
     Value *NewP = B.CreateGEP(I8Ty, ArgCode, B.CreateZExt(Target, I64Ty));
     B.CreateStore(NewP, CodePtr);
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
 
     // Conditional branch
     B.SetInsertPoint(CondBB);
-    EncodedValue C = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
-    Value *TrueTarget = readU32(B, CodePtr, EndPtr);
-    Value *FalseTarget = readU32(B, CodePtr, EndPtr);
+    EncodedValue C = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
+    Value *TrueTarget = readEncU32(B, CodePtr, EndPtr, KeyState);
+    Value *FalseTarget = readEncU32(B, CodePtr, EndPtr, KeyState);
 
     Value *Cond = B.CreateICmpNE(C.ValueU64, ConstantInt::get(I64Ty, 0));
     Value *TargetOff = B.CreateSelect(Cond, TrueTarget, FalseTarget);
+#ifdef SVM_INTERP_DEBUG
+    emitDebugBr(B, B.CreateLoad(I64Ty, CurIp), TargetOff);
+#endif
+    Value *TargetOff64 = B.CreateZExt(TargetOff, I64Ty);
+    Value *NewKey2 = hashSeedIp(B, Seed, TargetOff64);
+    B.CreateStore(NewKey2, NextKey);
     NewP = B.CreateGEP(I8Ty, ArgCode, B.CreateZExt(TargetOff, I64Ty));
     B.CreateStore(NewP, CodePtr);
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 
   // OP_ARITH handler
   void generateOpArith(llvm::Function *F, llvm::SwitchInst *Sw,
                        llvm::Value *CodePtr, llvm::Value *EndPtr,
+                       llvm::Value *KeyState,
                        llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
-                       llvm::BasicBlock *LoopHeader) {
+                       llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.arith", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_ARITH)), BB);
 
     IRBuilder<> B(BB);
-    Value *Sub = readU8(B, CodePtr, EndPtr);
-    Value *Tk = readU8(B, CodePtr, EndPtr);
-    Value *Bits = readU8(B, CodePtr, EndPtr);
-    Value *Dst = readU32(B, CodePtr, EndPtr);
-    EncodedValue L = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
-    EncodedValue R = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
+    Value *Sub = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *Tk = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *Bits = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *Dst = readEncU32(B, CodePtr, EndPtr, KeyState);
+    EncodedValue L = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
+    EncodedValue R = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
 
     // Integer arithmetic
     Value *Sub32 = B.CreateZExt(Sub, I32Ty);
@@ -848,23 +1250,24 @@ private:
                     B.CreateSelect(IsFRem, FRem, ConstantInt::get(I64Ty, 0)))))))))))))))))));
 
     dsStoreU64(B, DsBuf, DsSz, DsCap, Dst, Result);
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 
   // OP_CALL handler
   void generateOpCall(llvm::Function *F, llvm::SwitchInst *Sw,
                       llvm::Value *CodePtr, llvm::Value *EndPtr,
+                      llvm::Value *KeyState,
                       llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
-                      llvm::BasicBlock *LoopHeader) {
+                      llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.call", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_CALL)), BB);
 
     IRBuilder<> B(BB);
-    Value *Id = readU64(B, CodePtr, EndPtr);
-    Value *Dst = readU32(B, CodePtr, EndPtr);
-    Value *DynN = readU32(B, CodePtr, EndPtr);
+    Value *Id = readEncU64(B, CodePtr, EndPtr, KeyState);
+    Value *Dst = readEncU32(B, CodePtr, EndPtr, KeyState);
+    Value *DynN = readEncU32(B, CodePtr, EndPtr, KeyState);
 
     // Allocate args array
     Value *DynN64 = B.CreateZExt(DynN, I64Ty);
@@ -886,7 +1289,7 @@ private:
     B.CreateCondBr(Cond, LoopBody, LoopEnd);
 
     B.SetInsertPoint(LoopBody);
-    Value *Off = readU32(B, CodePtr, EndPtr);
+    Value *Off = readEncU32(B, CodePtr, EndPtr, KeyState);
     // Get pointer to data segment offset
     Value *OffPlus = B.CreateAdd(Off, ConstantInt::get(I32Ty, 1));
     ensureData(B, DsBuf, DsSz, DsCap, OffPlus);
@@ -920,12 +1323,13 @@ private:
     B.CreateBr(ContBB);
 
     B.SetInsertPoint(ContBB);
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 
   // OP_RET handler
   void generateOpRet(llvm::Function *F, llvm::SwitchInst *Sw,
                      llvm::Value *CodePtr, llvm::Value *EndPtr,
+                     llvm::Value *KeyState,
                      llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
                      llvm::Value *RetVal,
                      llvm::BasicBlock *ExitBlock) {
@@ -935,7 +1339,7 @@ private:
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_RET)), BB);
 
     IRBuilder<> B(BB);
-    EncodedValue V = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
+    EncodedValue V = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
     B.CreateStore(V.ValueU64, RetVal);
     B.CreateBr(ExitBlock);
   }
@@ -943,26 +1347,27 @@ private:
   // OP_SELECT handler
   void generateOpSelect(llvm::Function *F, llvm::SwitchInst *Sw,
                         llvm::Value *CodePtr, llvm::Value *EndPtr,
+                        llvm::Value *KeyState,
                         llvm::Value *DsBuf, llvm::Value *DsSz, llvm::Value *DsCap,
-                        llvm::BasicBlock *LoopHeader) {
+                        llvm::BasicBlock *LoopNext) {
     using namespace llvm;
 
     BasicBlock *BB = BasicBlock::Create(Ctx, "op.select", F);
     Sw->addCase(cast<ConstantInt>(ConstantInt::get(I8Ty, OP_SELECT)), BB);
 
     IRBuilder<> B(BB);
-    Value *Tk = readU8(B, CodePtr, EndPtr);
-    Value *Bits = readU8(B, CodePtr, EndPtr);
-    Value *Dst = readU32(B, CodePtr, EndPtr);
-    EncodedValue C = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
-    EncodedValue T = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
-    EncodedValue FV = readValue(B, CodePtr, EndPtr, DsBuf, DsSz, DsCap);
+    Value *Tk = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *Bits = readEncU8(B, CodePtr, EndPtr, KeyState);
+    Value *Dst = readEncU32(B, CodePtr, EndPtr, KeyState);
+    EncodedValue C = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
+    EncodedValue T = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
+    EncodedValue FV = readValue(B, CodePtr, EndPtr, KeyState, DsBuf, DsSz, DsCap);
 
     Value *Cond = B.CreateICmpNE(C.ValueU64, ConstantInt::get(I64Ty, 0));
     Value *Result = B.CreateSelect(Cond, T.ValueU64, FV.ValueU64);
 
     dsStoreU64(B, DsBuf, DsSz, DsCap, Dst, Result);
-    B.CreateBr(LoopHeader);
+    B.CreateBr(LoopNext);
   }
 };
 

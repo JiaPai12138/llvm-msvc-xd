@@ -72,15 +72,16 @@ PreservedAnalyses SmallVmpPass::run(Module &M, ModuleAnalysisManager &AM) {
   if (!hasCandidate) {
     return PreservedAnalyses::all();
   }
-
+  #ifdef SVM_VMP_DEBUG
   errs() << "[SmallVmpPass] Processing module: " << M.getName() << "\n";
-
+  #endif
   vmp::IRVMModuleTool tool;
   tool.setGlobalFlag(RunSmallVmp);
 
   bool changed = tool.run(M);
 
   auto st = tool.getStats();
+  #ifdef SVM_VMP_DEBUG
   errs() << "[SmallVmpPass] Summary:\n"
          << "  candidates=" << st.NumCandidates
          << " emitted=" << st.NumEmitted
@@ -89,7 +90,7 @@ PreservedAnalyses SmallVmpPass::run(Module &M, ModuleAnalysisManager &AM) {
          << " skipped(post)=" << st.NumSkippedPostSimplify
          << " skipped(codegen)=" << st.NumSkippedCodegen
          << "\n";
-
+  #endif
   if (changed) {
     return PreservedAnalyses::none();
   }
