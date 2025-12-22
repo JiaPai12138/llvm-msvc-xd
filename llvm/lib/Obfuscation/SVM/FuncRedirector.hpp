@@ -18,6 +18,7 @@
 #include "llvm/Support/Casting.h"
 
 #include "SVMInterpreterGen.h"
+#include "GlobalInit.hpp"
 
 namespace frx {
 using namespace llvm;
@@ -48,10 +49,10 @@ inline Function* getOrCreateVMExec(Module& M, StringRef Name,
   // LLVM 18: opaque pointers
   Type* PtrTy = PointerType::get(Ctx, 0);
   Type* I32  = Type::getInt32Ty(Ctx);
-  Type* I64  = Type::getInt64Ty(Ctx);
+  IntegerType* IntPtrT = ginit::IntPtrTy(M);
 
-  // uint64_t vm_exec(const uint8_t*, uint32_t, void** args, uint64_t num)
-  auto* FT = FunctionType::get(I64, { PtrTy, I32, PtrTy, I64 }, /*isVarArg=*/false);
+  // intptr_t vm_exec(const uint8_t*, uint32_t, void** args, intptr_t num)
+  auto* FT = FunctionType::get(IntPtrT, { PtrTy, I32, PtrTy, IntPtrT }, /*isVarArg=*/false);
   Function* F = cast<Function>(M.getOrInsertFunction(Name, FT).getCallee());
 
   if (GenerateInterpreter && F->empty()) {
@@ -85,7 +86,8 @@ inline bool rewriteToVMExec(Function& F,
   // LLVM 18: opaque pointers
   Type* PtrTy = PointerType::get(Ctx, 0);
   Type* I32  = Type::getInt32Ty(Ctx);
-  Type* I64  = Type::getInt64Ty(Ctx);
+  IntegerType* IntPtrT = ginit::IntPtrTy(M);
+  unsigned PtrBits = IntPtrT->getBitWidth();
 
   Function* VM = getOrCreateVMExec(M, Opt.VMName, Opt.GenerateInterpreter);
 
@@ -102,7 +104,7 @@ inline bool rewriteToVMExec(Function& F,
 
   // Args: box all arguments to stack
   const unsigned N = F.arg_size();
-  Value* NumC = ConstantInt::get(I64, N);
+  Value* NumC = ConstantInt::get(IntPtrT, N);
 
   // Allocate ptr* args (N==0 -> allocate 1 to avoid alloca(0))
   Value* N32 = ConstantInt::get(Type::getInt32Ty(Ctx), N ? N : 1);
@@ -122,6 +124,8 @@ inline bool rewriteToVMExec(Function& F,
         AddrPtr = &A;
       }
     } else if (A.getType()->isIntegerTy()) {
+      // VM slots are always 8 bytes, so Box must be i64
+      Type* I64 = Type::getInt64Ty(Ctx);
       AllocaInst* Box = B.CreateAlloca(I64, nullptr, A.getName() + ".box.i");
       Value* V = &A;
       unsigned bw = cast<IntegerType>(A.getType())->getBitWidth();
@@ -130,15 +134,22 @@ inline bool rewriteToVMExec(Function& F,
       B.CreateStore(V, Box);
       AddrPtr = Box;
     } else if (A.getType()->isFloatingPointTy()) {
+      // VM slots are always 8 bytes
+      Type* I64 = Type::getInt64Ty(Ctx);
       if (A.getType()->isDoubleTy()) {
-        AllocaInst* BoxD = B.CreateAlloca(Type::getDoubleTy(Ctx), nullptr, A.getName() + ".box.f64");
+        // Double is 8 bytes, but store via i64 alloca for consistency
+        AllocaInst* BoxD = B.CreateAlloca(I64, nullptr, A.getName() + ".box.f64");
         B.CreateStore(&A, BoxD);
         AddrPtr = BoxD;
       } else if (A.getType()->isFloatTy()) {
-        AllocaInst* BoxF = B.CreateAlloca(Type::getFloatTy(Ctx), nullptr, A.getName() + ".box.f32");
-        B.CreateStore(&A, BoxF);
+        // Float is 4 bytes, need 8-byte slot. Store f32 then zero-extend to i64
+        AllocaInst* BoxF = B.CreateAlloca(I64, nullptr, A.getName() + ".box.f32");
+        Value* AsI32 = B.CreateBitCast(&A, Type::getInt32Ty(Ctx));
+        Value* AsI64 = B.CreateZExt(AsI32, I64);
+        B.CreateStore(AsI64, BoxF);
         AddrPtr = BoxF;
       } else {
+        // Other FP types (e.g., x86_fp80, fp128): use original type but ensure 8-byte minimum
         Type* FT = A.getType();
         AllocaInst* Box = B.CreateAlloca(FT, nullptr, A.getName() + ".box.fp");
         B.CreateStore(&A, Box);
@@ -160,8 +171,8 @@ inline bool rewriteToVMExec(Function& F,
   }
 
   // Call vm_exec(code, size, args, num)
-  CallInst* RetI64 = B.CreateCall(VM, { CodePtrC, CodeSizeC, ArgsArr, NumC });
-  if (Opt.UseTailCall) RetI64->setTailCallKind(CallInst::TCK_Tail);
+  CallInst* RetIntPtr = B.CreateCall(VM, { CodePtrC, CodeSizeC, ArgsArr, NumC });
+  if (Opt.UseTailCall) RetIntPtr->setTailCallKind(CallInst::TCK_Tail);
 
   // Convert return value
   Type* RT = F.getReturnType();
@@ -169,21 +180,28 @@ inline bool rewriteToVMExec(Function& F,
     B.CreateRetVoid();
   } else if (RT->isIntegerTy()) {
     unsigned W = cast<IntegerType>(RT)->getBitWidth();
-    Value* V = RetI64;
-    if (W < 64) V = B.CreateTrunc(V, RT);
-    else if (W > 64) V = UndefValue::get(RT);
+    Value* V = RetIntPtr;
+    if (W < PtrBits) V = B.CreateTrunc(V, RT);
+    else if (W > PtrBits) V = B.CreateZExt(V, RT);
+    // else: W == PtrBits, no conversion needed
     B.CreateRet(V);
   } else if (RT->isPointerTy()) {
-    B.CreateRet(B.CreateIntToPtr(RetI64, RT));
+    B.CreateRet(B.CreateIntToPtr(RetIntPtr, RT));
   } else if (RT->isDoubleTy()) {
+    // Double: need 64 bits, but on 32-bit we only have 32-bit return value
+    // Store IntPtrTy to memory and reinterpret as double
+    // WARNING: On 32-bit platforms, only low 32 bits are valid - double returns are lossy
+    Type* I64 = Type::getInt64Ty(Ctx);
     AllocaInst* Box = B.CreateAlloca(I64);
-    B.CreateStore(RetI64, Box);
-    // LLVM 18: opaque pointer, load directly
+    Value* Extended = B.CreateZExt(RetIntPtr, I64);
+    B.CreateStore(Extended, Box);
     Value* D = B.CreateLoad(Type::getDoubleTy(Ctx), Box);
     B.CreateRet(D);
   } else if (RT->isFloatTy()) {
-    Value* I32v = B.CreateTrunc(RetI64, Type::getInt32Ty(Ctx));
-    AllocaInst* Box = B.CreateAlloca(Type::getInt32Ty(Ctx));
+    // Float: reinterpret low 32 bits as float via memory
+    Type* I32 = Type::getInt32Ty(Ctx);
+    AllocaInst* Box = B.CreateAlloca(I32);
+    Value* I32v = B.CreateTruncOrBitCast(RetIntPtr, I32);
     B.CreateStore(I32v, Box);
     Value* Fv = B.CreateLoad(Type::getFloatTy(Ctx), Box);
     B.CreateRet(Fv);

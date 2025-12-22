@@ -95,6 +95,8 @@ public:
     Code.clear();
     Instrs.clear();
     IpHashSet.clear();
+
+    // Header: 8-byte seed
     p64(Code, seed);
 
     expandConstantExprs();

@@ -79,10 +79,12 @@ public:
     F32Ty = llvm::Type::getFloatTy(Ctx);
     F64Ty = llvm::Type::getDoubleTy(Ctx);
     PtrTy = llvm::PointerType::get(Ctx, 0);
+    IntPtrTy = llvm::cast<llvm::IntegerType>(
+        M.getDataLayout().getIntPtrType(Ctx));
   }
 
   /// Generate or get vm_exec function
-  /// Signature: uint64_t vm_exec(const uint8_t* code, uint32_t size, void** args, uint64_t num)
+  /// Signature: intptr_t vm_exec(const uint8_t* code, uint32_t size, void** args, intptr_t num)
   llvm::Function* getOrCreateVMExec() {
     // Check if already exists
     if (auto *F = M.getFunction("vm_exec")) {
@@ -92,7 +94,7 @@ public:
     // Create function with InternalLinkage
     // Each translation unit has its own vm_exec + handle_call pair
     // This avoids cross-unit linkage issues with handle_call dispatch
-    auto *FT = llvm::FunctionType::get(I64Ty, {PtrTy, I32Ty, PtrTy, I64Ty}, false);
+    auto *FT = llvm::FunctionType::get(IntPtrTy, {PtrTy, I32Ty, PtrTy, IntPtrTy}, false);
     auto *F = llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage, "vm_exec", &M);
     F->setDoesNotThrow();
 
@@ -115,14 +117,15 @@ private:
 
   // Cached types
   llvm::Type *VoidTy, *I1Ty, *I8Ty, *I32Ty, *I64Ty, *F32Ty, *F64Ty, *PtrTy;
+  llvm::IntegerType *IntPtrTy;  // Pointer-sized integer type from DataLayout
 
   // Runtime function declarations
   llvm::FunctionCallee getMalloc() {
-    return M.getOrInsertFunction("malloc", PtrTy, I64Ty);
+    return M.getOrInsertFunction("malloc", PtrTy, IntPtrTy);
   }
 
   llvm::FunctionCallee getRealloc() {
-    return M.getOrInsertFunction("realloc", PtrTy, PtrTy, I64Ty);
+    return M.getOrInsertFunction("realloc", PtrTy, PtrTy, IntPtrTy);
   }
 
   llvm::FunctionCallee getFree() {
@@ -130,11 +133,11 @@ private:
   }
 
   llvm::FunctionCallee getMemcpy() {
-    return M.getOrInsertFunction("memcpy", PtrTy, PtrTy, PtrTy, I64Ty);
+    return M.getOrInsertFunction("memcpy", PtrTy, PtrTy, PtrTy, IntPtrTy);
   }
 
   llvm::FunctionCallee getMemset() {
-    return M.getOrInsertFunction("memset", PtrTy, PtrTy, I32Ty, I64Ty);
+    return M.getOrInsertFunction("memset", PtrTy, PtrTy, I32Ty, IntPtrTy);
   }
 
   llvm::FunctionCallee getHandleCall() {
@@ -195,11 +198,11 @@ private:
     B.CreateStore(ConstantInt::get(I32Ty, 0), DsCap);
     B.CreateStore(ConstantInt::get(I64Ty, 0), RetVal);
 
-    // Seed is stored at code[0..7]
+    // Header: 8-byte seed at offset 0
     Value *Seed = B.CreateLoad(I64Ty, ArgCode, "seed");
     B.CreateStore(Seed, KeyVar);
 
-    // Start of encrypted stream = code + 8
+    // Code starts at offset 8
     Value *Start = B.CreateGEP(I8Ty, ArgCode, ConstantInt::get(I64Ty, 8), "code.start");
     B.CreateStore(Start, CodePtr);
 
@@ -228,9 +231,9 @@ private:
     P = B.CreateLoad(PtrTy, CodePtr, "p.cur");
     B.CreateStore(P, InstrStart);
 
-    Value *PInt = B.CreatePtrToInt(P, I64Ty);
-    Value *BaseInt = B.CreatePtrToInt(ArgCode, I64Ty);
-    Value *Ip = B.CreateSub(PInt, BaseInt, "ip");
+    Value *PInt = B.CreatePtrToInt(P, IntPtrTy);
+    Value *BaseInt = B.CreatePtrToInt(ArgCode, IntPtrTy);
+    Value *Ip = B.CreateZExt(B.CreateSub(PInt, BaseInt), I64Ty, "ip");
     B.CreateStore(Ip, CurIp);
 #ifdef SVM_INTERP_DEBUG
     emitDebugFetch(B, Ip, CurKey);
@@ -245,8 +248,8 @@ private:
     Value *Len1 = readEncU16(B, TmpPtr, EndPtr, TmpKey);
     Value *Crc1 = readEncU16(B, TmpPtr, EndPtr, TmpKey);
     Value *TmpPtr1 = B.CreateLoad(PtrTy, TmpPtr);
-    Value *Rem1 = B.CreateSub(B.CreatePtrToInt(EndPtr, I64Ty),
-                              B.CreatePtrToInt(TmpPtr1, I64Ty));
+    Value *Rem1 = B.CreateZExt(B.CreateSub(B.CreatePtrToInt(EndPtr, IntPtrTy),
+                              B.CreatePtrToInt(TmpPtr1, IntPtrTy)), I64Ty);
     Value *Len1_64 = B.CreateZExt(Len1, I64Ty);
     Value *LenOk1 = B.CreateICmpULE(Len1_64, Rem1);
 #ifdef SVM_INTERP_DEBUG
@@ -299,8 +302,8 @@ private:
     Value *Len2 = readEncU16(B, TmpPtr, EndPtr, TmpKey);
     Value *Crc2 = readEncU16(B, TmpPtr, EndPtr, TmpKey);
     Value *TmpPtr2 = B.CreateLoad(PtrTy, TmpPtr);
-    Value *Rem2 = B.CreateSub(B.CreatePtrToInt(EndPtr, I64Ty),
-                              B.CreatePtrToInt(TmpPtr2, I64Ty));
+    Value *Rem2 = B.CreateZExt(B.CreateSub(B.CreatePtrToInt(EndPtr, IntPtrTy),
+                              B.CreatePtrToInt(TmpPtr2, IntPtrTy)), I64Ty);
     Value *Len2_64 = B.CreateZExt(Len2, I64Ty);
     Value *LenOk2 = B.CreateICmpULE(Len2_64, Rem2);
     BasicBlock *Crc2BB = BasicBlock::Create(Ctx, "crc2.chk", F);
@@ -388,7 +391,8 @@ private:
     Value *BufToFree = B.CreateLoad(PtrTy, DsBuf);
     B.CreateCall(getFree(), {BufToFree});
     Value *Ret = B.CreateLoad(I64Ty, RetVal);
-    B.CreateRet(Ret);
+    // Truncate to IntPtrTy for 32-bit targets
+    B.CreateRet(B.CreateTruncOrBitCast(Ret, IntPtrTy));
   }
 
   // xxhash-like mix / stream helpers
@@ -582,8 +586,8 @@ private:
 
   void emitDebugPtr(llvm::IRBuilder<> &B, llvm::Value *P, llvm::Value *End) {
     using namespace llvm;
-    Value *P64 = B.CreatePtrToInt(P, I64Ty);
-    Value *E64 = B.CreatePtrToInt(End, I64Ty);
+    Value *P64 = B.CreateZExt(B.CreatePtrToInt(P, IntPtrTy), I64Ty);
+    Value *E64 = B.CreateZExt(B.CreatePtrToInt(End, IntPtrTy), I64Ty);
     Value *Fmt = B.CreateGlobalStringPtr(
         "[svm.exec] ptr p=0x%llx end=0x%llx\n");
     B.CreateCall(getPrintf(), {Fmt, P64, E64});
@@ -683,13 +687,13 @@ private:
 
     Value *OldBuf = B.CreateLoad(PtrTy, DsBuf);
     Value *NewBuf = B.CreateCall(getRealloc(),
-        {OldBuf, B.CreateZExt(NewCap, I64Ty)});
+        {OldBuf, B.CreateZExtOrTrunc(NewCap, IntPtrTy)});
 
     // Memset new area
     Value *OldCap = B.CreateLoad(I32Ty, DsCap);
     Value *NewArea = B.CreateGEP(I8Ty, NewBuf, B.CreateZExt(OldCap, I64Ty));
     Value *ClearLen = B.CreateSub(NewCap, OldCap);
-    B.CreateCall(getMemset(), {NewArea, ConstantInt::get(I32Ty, 0), B.CreateZExt(ClearLen, I64Ty)});
+    B.CreateCall(getMemset(), {NewArea, ConstantInt::get(I32Ty, 0), B.CreateZExtOrTrunc(ClearLen, IntPtrTy)});
 
     B.CreateStore(NewBuf, DsBuf);
     B.CreateStore(NewCap, DsCap);
@@ -841,14 +845,14 @@ private:
     B.SetInsertPoint(DoCopyBB);
     Value *Buf = B.CreateLoad(PtrTy, DsBuf);
     Value *DstPtr = B.CreateGEP(I8Ty, Buf, B.CreateZExt(Off, I64Ty));
-    B.CreateCall(getMemcpy(), {DstPtr, ArgPtr, B.CreateZExt(Sz, I64Ty)});
+    B.CreateCall(getMemcpy(), {DstPtr, ArgPtr, B.CreateZExtOrTrunc(Sz, IntPtrTy)});
     B.CreateBr(NextBB);
 
     // Zero fill
     B.SetInsertPoint(ZeroBB);
     Buf = B.CreateLoad(PtrTy, DsBuf);
     DstPtr = B.CreateGEP(I8Ty, Buf, B.CreateZExt(Off, I64Ty));
-    B.CreateCall(getMemset(), {DstPtr, ConstantInt::get(I32Ty, 0), B.CreateZExt(Sz, I64Ty)});
+    B.CreateCall(getMemset(), {DstPtr, ConstantInt::get(I32Ty, 0), B.CreateZExtOrTrunc(Sz, IntPtrTy)});
     B.CreateBr(NextBB);
 
     // Next iteration
@@ -879,8 +883,8 @@ private:
     Value *Area = readEncU32(B, CodePtr, EndPtr, KeyState);
 
     // malloc(area)
-    Value *Mem = B.CreateCall(getMalloc(), {B.CreateZExt(Area, I64Ty)});
-    Value *MemI64 = B.CreatePtrToInt(Mem, I64Ty);
+    Value *Mem = B.CreateCall(getMalloc(), {B.CreateZExtOrTrunc(Area, IntPtrTy)});
+    Value *MemI64 = B.CreateZExt(B.CreatePtrToInt(Mem, IntPtrTy), I64Ty);
 
     // Store to data segment
     dsStoreU64(B, DsBuf, DsSz, DsCap, Dst, MemI64);
@@ -1270,8 +1274,8 @@ private:
     Value *DynN = readEncU32(B, CodePtr, EndPtr, KeyState);
 
     // Allocate args array
-    Value *DynN64 = B.CreateZExt(DynN, I64Ty);
-    Value *ArgsSize = B.CreateMul(DynN64, ConstantInt::get(I64Ty, 8));
+    Value *DynNPtr = B.CreateZExt(DynN, IntPtrTy);
+    Value *ArgsSize = B.CreateMul(DynNPtr, ConstantInt::get(IntPtrTy, 8));
     Value *Args = B.CreateCall(getMalloc(), {ArgsSize});
 
     // Fill args array
@@ -1306,7 +1310,8 @@ private:
     B.CreateBr(LoopHdr);
 
     B.SetInsertPoint(LoopEnd);
-    // Call handle_call
+    // Call handle_call (expects I64 for num parameter)
+    Value *DynN64 = B.CreateZExt(DynN, I64Ty);
     Value *Result = B.CreateCall(getHandleCall(), {Id, Args, DynN64});
 
     // Free args
