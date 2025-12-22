@@ -41,6 +41,7 @@ https://github.com/gmh5225/awesome-llvm-security#ollvm
 - [x] -rich for lld-link option to build pe with rich-header
 - [x] -x-pic for -fPIC in windows (-mllvm -x-pic -mllvm -xpic-global -mllvm -xpic-memset -mllvm -xpic-memcpy)
 - [x] -x-vmobf (next vm,vm_runtime is not public)
+- [x] -x-mba (mba easy mode)
 - [ ] new functions
 
 

@@ -8,7 +8,9 @@
 #include "IndirectCall.h"
 #include "IndirectGlobalVars.h"
 #include "Linearize.h"
+#include "LinearMBA.h"
 #include "MBAObfuscation.h"
+#include "SmallVmpPass.h"
 #include "SplitBasicBlock.h"
 #include "StringObfuscation.h"
 #include "Substitution.h"
@@ -45,12 +47,14 @@ llvm::PassPluginLibraryInfo getObfuscationPluginInfo() {
 
         PB.registerPipelineStartEPCallback([](llvm::ModulePassManager &MPM,
                                               OptimizationLevel Level) {
+          MPM.addPass(SmallVmpPass());
           MPM.addPass(VmObfuscatorPass());
           MPM.addPass(createModuleToFunctionPassAdaptor(SplitBasicBlockPass()));
           MPM.addPass(
               createModuleToFunctionPassAdaptor(BogusControlFlowPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(SubstitutionPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(MBAObfuscationPass()));
+          MPM.addPass(createModuleToFunctionPassAdaptor(LinearMBAPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(FlatteningPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(VmProtectPass()));
           
